@@ -16,7 +16,7 @@
 from dataclasses import dataclass
 
 from app.domain import AgentEvent, Message, ToolCall
-from app.model import FakeModel
+from app.model import ModelProvider
 from app.tools import ToolRegistry, build_default_registry
 
 
@@ -56,9 +56,9 @@ class TravelAgent:
     # 阶段 1 只允许一次工具往返，防止还没学习停止条件就引入无限循环。
     MAX_TOOL_ROUNDS = 1
 
-    def __init__(self, model: FakeModel, registry: ToolRegistry | None = None) -> None:
+    def __init__(self, model: ModelProvider, registry: ToolRegistry | None = None) -> None:
         # 保存模型依赖，但不复制或修改模型对象。
-        # Agent 负责流程，FakeModel 负责产生模型回复。
+        # Agent 负责流程，具体的 ModelProvider 实现负责产生模型回复。
         self.model = model
 
         # 允许调用方注入一组受限工具；不传时使用默认天气工具。
@@ -110,6 +110,10 @@ class TravelAgent:
         tool_rounds = 0
 
         while True:
+            # 每次请求都重新生成工具目录，确保模型看到的是当前注册表
+            # 允许使用的能力，而不是 Agent 内部写死的一份列表。
+            tool_schemas = self.registry.model_schemas()
+
             # 每次请求模型前都记录消息摘要。
             # 第二次请求会包含 assistant 的 ToolCall 和 tool observation，
             # 这正是 Agent Loop 与阶段 0 单轮调用的关键区别。
@@ -119,12 +123,14 @@ class TravelAgent:
                     payload={
                         "message_count": len(messages),
                         "roles": [message.role for message in messages],
+                        "tool_count": len(tool_schemas),
                     },
                 )
             )
 
             # 模型可能直接回答，也可能提出工具调用。
-            model_output = self.model.complete(messages)
+            # Agent 只依赖 ModelProvider 契约，不关心具体供应商实现。
+            model_output = self.model.complete(messages, tools=tool_schemas)
 
             if isinstance(model_output, str):
                 # 只有文本回复可以成为最终答案。

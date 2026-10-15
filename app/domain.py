@@ -33,6 +33,10 @@ class ToolCall:
     # 当前阶段使用字典；参数 schema 和严格校验留到工具系统阶段。
     arguments: dict[str, object]
 
+    # DeepSeek thinking/tool-call 模式可能返回 reasoning_content。
+    # Runtime 不把它展示给用户，但下一轮请求需要原样带回供应商。
+    reasoning_content: str | None = None
+
 
 @dataclass(frozen=True)
 class Message:

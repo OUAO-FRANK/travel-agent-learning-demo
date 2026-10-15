@@ -72,6 +72,25 @@ class TravelAgentTests(unittest.TestCase):
             ],
         )
 
+    def test_run_sends_registered_tool_schemas_to_model(self):
+        """模型请求必须包含当前注册表的工具说明。"""
+
+        model = FakeModel(["这是一个上海三日游计划。"])
+        agent = TravelAgent(model)
+
+        agent.run("计划上海三日游")
+
+        self.assertEqual(
+            model.tool_requests[0],
+            [
+                {
+                    "name": "get_weather",
+                    "description": "查询固定城市的天气示例数据",
+                    "parameters": {"city": "str"},
+                }
+            ],
+        )
+
     def test_run_emits_ordered_events(self):
         model = FakeModel(["先安排外滩，再参观历史建筑。"])
         agent = TravelAgent(model)

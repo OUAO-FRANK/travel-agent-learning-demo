@@ -15,13 +15,12 @@ CLI 输入
   -> 事件轨迹和最终答案
 ```
 
-当前版本：
+当前版本支持两种模式：
 
-- 不访问网络；
-- 不调用真实 LLM；
-- 不需要 API Key；
-- 默认注册表只启用固定数据的 `get_weather` 工具，但 Agent 也支持注入其他工具；
-- 每次使用固定的 Fake Model 回复。
+- `fake`：默认模式，不访问网络、不需要 API Key，结果确定；
+- `deepseek`：使用 DeepSeek OpenAI-compatible API，需要环境变量中的 API Key。
+
+默认注册表只启用固定数据的 `get_weather` 工具，但 Agent 也支持注入其他工具。
 
 当前已经有最小的通用工具注册表、参数 schema 和多工具分发能力：
 
@@ -30,7 +29,18 @@ CLI 输入
 - `TravelAgent` 可以注入自定义注册表，因此不需要在 Agent 内部增加
   `if tool_name == ...` 分支。
 
-当前 schema 是教学用的简化形式，完整 JSON Schema 和真实模型适配仍在后续阶段加入。
+当前 schema 在注册表内部仍是教学用的简化形式；Provider 会在发送请求前把它转换成
+JSON Schema。
+
+当前模型边界也已经抽象为 `ModelProvider`：Agent 每次请求都会把消息和工具目录
+一起交给模型。项目现在同时提供：
+
+- `FakeModel`：不联网、可重复、用于理解和测试；
+- `OpenAICompatibleModel`：负责把内部消息和工具说明转换为兼容 Chat Completions
+  的 HTTP 请求，并解析文本或工具调用响应。
+
+Provider 的 HTTP 传输函数可以注入测试替身，因此测试不需要 API Key 或网络，Agent
+主循环也不需要知道供应商协议细节。
 
 ## 运行
 
@@ -48,6 +58,32 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m app "我想下周去上海玩三�
 ```
 
 程序会先输出事件轨迹，再输出最终答案。
+
+使用真实 DeepSeek 模型时，在同一个 PowerShell 窗口中先设置 API key：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "你的 DeepSeek API key"
+$env:DEEPSEEK_MODEL = "deepseek-flash"
+```
+
+然后运行：
+
+```powershell
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider deepseek `
+  "我想下周去上海玩三天，预算 2000 元，喜欢历史景点"
+```
+
+如果你要显式使用旧名称 `deepseek-v4-flash`，只需改为：
+
+```powershell
+$env:DEEPSEEK_MODEL = "deepseek-v4-flash"
+```
+
+当前官方模型列表使用 `deepseek-flash`；旧名称仍可能被兼容接受，因此默认采用官方当前标识。
+也可以设置 `DEEPSEEK_BASE_URL` 覆盖默认地址 `https://api.deepseek.com`。
+
+不要把 API key 写入源码、README、测试文件或 Git 提交。`.env` 已被 `.gitignore` 忽略，但当前项目默认不自动读取 `.env`，最直观的方式是使用上面的 PowerShell 环境变量。
 
 ## 测试
 
