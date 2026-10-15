@@ -2,6 +2,7 @@ import unittest
 
 from app.domain import AgentEvent, Message, ToolCall
 from app.agent import TravelAgent
+from app.context import ContextBuilder
 from app.model import FakeModel
 from app.tools import ToolDefinition, ToolRegistry
 
@@ -57,6 +58,25 @@ class FakeModelTests(unittest.TestCase):
 
 
 class TravelAgentTests(unittest.TestCase):
+    def test_run_uses_context_builder_for_model_request_metadata(self):
+        """Agent 事件应记录实际上下文窗口，而不是内部完整历史。"""
+
+        model = FakeModel(["这是一个上海三日游计划。"])
+        agent = TravelAgent(
+            model,
+            context_builder=ContextBuilder(
+                system_prompt="你是旅行规划助手。",
+                max_messages=2,
+            ),
+        )
+
+        result = agent.run("计划上海三日游")
+
+        request_event = result.events[1]
+        self.assertEqual(request_event.kind, "model_request")
+        self.assertEqual(request_event.payload["message_count"], 2)
+        self.assertEqual(request_event.payload["dropped_messages"], 0)
+
     def test_run_sends_system_and_user_messages_to_model(self):
         model = FakeModel(["这是一个上海三日游计划。"])
         agent = TravelAgent(model)

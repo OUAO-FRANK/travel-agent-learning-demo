@@ -274,17 +274,19 @@ API key 只写入当前 PowerShell 进程环境。也可以写入用户级环境
 
 **实现增量**：
 
-- 把 system prompt 独立为配置；
-- 统一组装消息、工具目录和运行元数据；
-- 引入 token/消息数量预算的教学版估算；
-- 截断旧历史并记录事件；
-- 对比完整历史与发送上下文。
+- `ContextBuilder` 独立组装 system prompt、历史消息和工具目录；
+- 用消息数量实现第一版上下文预算，暂不假装精确计算 token；
+- 从最新对话轮次开始截断旧历史；
+- 将 `assistant tool_call -> tool result` 作为不可拆分的一轮；
+- 在 `model_request` 事件中记录实际消息数、工具数和丢弃消息数；
+- 保留 Agent 内部完整历史，同时只把上下文窗口发送给模型。
 
 **必须理解**：上下文不是数据库，Prompt 不是记忆，工具定义也是上下文的一部分。
 
 **失败实验**：无限追加历史，观察上下文预算和旧信息干扰。
 
-**验收证据**：打印“保存历史”和“实际请求”两份不同视图。
+**验收证据**：`tests/test_context.py` 验证窗口选择、工具 schema 快照和预算边界；
+`TravelAgent` 的 `model_request` 事件暴露实际请求窗口。
 
 **Hermes 对照**：对应上下文构造、消息压缩和请求前处理。
 
@@ -532,6 +534,7 @@ AI 不自动 commit 或 push。每次提交前先展示变更摘要，由用户�
 - 阶段 2：工具注册表和 schema 校验；
 - 阶段 3 的 Provider 核心：`ModelProvider`、OpenAI-compatible 转换和测试；
 - DeepSeek 配置入口：`--provider deepseek`、`DEEPSEEK_API_KEY`、默认 `deepseek-flash`。
+- 阶段 4：`ContextBuilder`、消息预算、完整工具回合保留和上下文观测事件。
 
 当前正在完成：
 
@@ -541,9 +544,9 @@ AI 不自动 commit 或 push。每次提交前先展示变更摘要，由用户�
 
 下一阶段：
 
-- Prompt 与上下文模块；
-- 把 system prompt、历史、工具目录和实际发送 payload 明确分层；
-- 再进入 SQLite 会话持久化。
+- SQLite 会话持久化；
+- 保存 sessions、messages、events 和 tool_calls；
+- 验证进程重启后的会话恢复。
 
 ## 8. 每阶段验收总标准
 

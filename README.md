@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-当前实现确定性的单工具 Agent Loop：
+当前实现确定性的单工具 Agent Loop，并已加入第一版上下文窗口：
 
 ```text
 CLI 输入
@@ -14,6 +14,10 @@ CLI 输入
   -> FakeModel 返回最终文本
   -> 事件轨迹和最终答案
 ```
+
+`ContextBuilder` 会把 system prompt、最近的完整对话轮次和工具目录组装成
+模型本轮真正收到的请求；Agent 内部的完整历史与这个请求窗口是两个不同概念。
+当前用消息数量做教学版预算，工具调用请求和工具结果会作为一轮整体保留。
 
 当前版本支持两种模式：
 
@@ -101,3 +105,4 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m unittest discover -v
 - CLI 是否把运行轨迹展示出来；
 - 工具注册表是否拒绝未知工具、重复名称和非法参数；
 - Agent 是否通过注入的注册表执行自定义工具。
+- 上下文窗口是否保留 system prompt、完整工具回合，并正确记录被截断的历史。

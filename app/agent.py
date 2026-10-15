@@ -15,6 +15,7 @@
 
 from dataclasses import dataclass
 
+from app.context import ContextBuilder
 from app.domain import AgentEvent, Message, ToolCall
 from app.model import ModelProvider
 from app.tools import ToolRegistry, build_default_registry
@@ -56,7 +57,12 @@ class TravelAgent:
     # 阶段 1 只允许一次工具往返，防止还没学习停止条件就引入无限循环。
     MAX_TOOL_ROUNDS = 1
 
-    def __init__(self, model: ModelProvider, registry: ToolRegistry | None = None) -> None:
+    def __init__(
+        self,
+        model: ModelProvider,
+        registry: ToolRegistry | None = None,
+        context_builder: ContextBuilder | None = None,
+    ) -> None:
         # 保存模型依赖，但不复制或修改模型对象。
         # Agent 负责流程，具体的 ModelProvider 实现负责产生模型回复。
         self.model = model
@@ -68,6 +74,14 @@ class TravelAgent:
         # 自定义注册表也不会被错误替换成默认注册表。
         self.registry = (
             build_default_registry() if registry is None else registry
+        )
+
+        # ContextBuilder 独立负责“哪些内容进入这次请求”。Agent 仍保存完整
+        # 对话历史，但不再自己决定 system prompt 和历史窗口如何组装。
+        self.context_builder = (
+            ContextBuilder(system_prompt=self.SYSTEM_PROMPT)
+            if context_builder is None
+            else context_builder
         )
 
     def run(self, user_text: str) -> AgentResult:
@@ -100,19 +114,19 @@ class TravelAgent:
             )
         )
 
-        # 消息列表是“发给模型的上下文”。
-        # system 消息提供应用规则，user 消息承载当前任务。
+        # history 是 Agent 内部累积的对话历史，不直接等同于模型请求。
+        # system prompt 在每轮由 ContextBuilder 加入，避免混入可截断历史。
         messages = [
-            Message(role="system", content=self.SYSTEM_PROMPT),
             Message(role="user", content=user_text),
         ]
 
         tool_rounds = 0
 
         while True:
-            # 每次请求都重新生成工具目录，确保模型看到的是当前注册表
-            # 允许使用的能力，而不是 Agent 内部写死的一份列表。
+            # 每次请求都从当前注册表获取工具目录，再与对话历史一起交给
+            # ContextBuilder。ContextBuilder 的输出才是实际发送给模型的窗口。
             tool_schemas = self.registry.model_schemas()
+            context = self.context_builder.build(messages, tool_schemas)
 
             # 每次请求模型前都记录消息摘要。
             # 第二次请求会包含 assistant 的 ToolCall 和 tool observation，
@@ -121,16 +135,20 @@ class TravelAgent:
                 AgentEvent(
                     kind="model_request",
                     payload={
-                        "message_count": len(messages),
-                        "roles": [message.role for message in messages],
-                        "tool_count": len(tool_schemas),
+                        "message_count": len(context.messages),
+                        "roles": [message.role for message in context.messages],
+                        "tool_count": len(context.tools),
+                        "dropped_messages": context.dropped_messages,
                     },
                 )
             )
 
             # 模型可能直接回答，也可能提出工具调用。
             # Agent 只依赖 ModelProvider 契约，不关心具体供应商实现。
-            model_output = self.model.complete(messages, tools=tool_schemas)
+            model_output = self.model.complete(
+                list(context.messages),
+                tools=list(context.tools),
+            )
 
             if isinstance(model_output, str):
                 # 只有文本回复可以成为最终答案。
