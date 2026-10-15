@@ -8,9 +8,9 @@
       -> 如果是 ToolCall，则执行工具并把 observation 放回消息
       -> FakeModel 返回最终文本回答
 
-这里已经加入了最小工具调用，但暂时没有加入自动重试、记忆、RAG 或持久化。
-这些能力会在后续阶段逐一加入。先把最短控制流写清楚，才能知道后面
-新增的每个分支到底改变了什么。
+这里已经加入了最小工具调用和可选的 SQLite 会话持久化，但暂时没有加入
+自动重试、记忆、RAG 或复杂 checkpoint。先把最短控制流写清楚，才能知道
+后续新增的每个分支到底改变了什么。
 """
 
 from dataclasses import dataclass
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from app.context import ContextBuilder
 from app.domain import AgentEvent, Message, ToolCall
 from app.model import ModelProvider
+from app.storage import SQLiteSessionStore
 from app.tools import ToolRegistry, build_default_registry
 
 
@@ -41,9 +42,9 @@ class AgentResult:
 class TravelAgent:
     """负责组织一次旅行规划请求的最小 Agent。
 
-    当前 Agent 的决策规则是：收到用户文本后，构造固定的 system/user
-    消息；如果模型返回 ToolCall，就执行一次允许的工具，把工具结果
-    加回消息列表，再请求模型生成最终文本。
+    当前 Agent 的决策规则是：收到用户文本后，加载可选历史，构造固定的
+    system/user 消息；如果模型返回 ToolCall，就执行一次允许的工具，把
+    工具结果加回消息列表，再请求模型生成最终文本，并按需记录持久化证据。
 
     这里的 ``model`` 通过构造函数传入，而不是在类内部直接创建
     ``FakeModel``。这叫依赖注入：Agent 只依赖“有 complete 方法的模型”，
@@ -62,6 +63,7 @@ class TravelAgent:
         model: ModelProvider,
         registry: ToolRegistry | None = None,
         context_builder: ContextBuilder | None = None,
+        session_store: SQLiteSessionStore | None = None,
     ) -> None:
         # 保存模型依赖，但不复制或修改模型对象。
         # Agent 负责流程，具体的 ModelProvider 实现负责产生模型回复。
@@ -84,7 +86,15 @@ class TravelAgent:
             else context_builder
         )
 
-    def run(self, user_text: str) -> AgentResult:
+        # session_store 是可选依赖。默认保持纯内存运行，避免早期阶段的
+        # FakeModel 测试和 CLI 示例必须创建数据库；传入它才开启持久化。
+        self.session_store = session_store
+
+    def run(
+        self,
+        user_text: str,
+        session_id: str | None = None,
+    ) -> AgentResult:
         """执行一次最小 Agent 运行并返回答案与事件轨迹。
 
         数据流按以下顺序发生：
@@ -102,23 +112,35 @@ class TravelAgent:
         再单独设计和测试。
         """
 
+        if self.session_store is not None and session_id is None:
+            # 存储多个会话时必须有稳定键；静默使用固定名称会把不同用户
+            # 的旅行请求混在一起，因此明确要求调用方传入 session_id。
+            raise ValueError("session_id is required when session_store is enabled")
+
         # 事件列表是本次 run 的局部状态。
         # 每次调用 run 都新建一份，避免两次用户请求共享历史事件。
         events: list[AgentEvent] = []
 
         # 先记录输入，方便从轨迹开头还原用户请求。
-        events.append(
+        self._record_event(
+            events,
             AgentEvent(
                 kind="user_input",
                 payload={"content": user_text},
-            )
+            ),
+            session_id,
         )
 
         # history 是 Agent 内部累积的对话历史，不直接等同于模型请求。
         # system prompt 在每轮由 ContextBuilder 加入，避免混入可截断历史。
-        messages = [
-            Message(role="user", content=user_text),
-        ]
+        messages = (
+            self.session_store.load_messages(session_id)
+            if self.session_store is not None and session_id is not None
+            else []
+        )
+        user_message = Message(role="user", content=user_text)
+        messages.append(user_message)
+        self._record_message(user_message, session_id)
 
         tool_rounds = 0
 
@@ -131,7 +153,8 @@ class TravelAgent:
             # 每次请求模型前都记录消息摘要。
             # 第二次请求会包含 assistant 的 ToolCall 和 tool observation，
             # 这正是 Agent Loop 与阶段 0 单轮调用的关键区别。
-            events.append(
+            self._record_event(
+                events,
                 AgentEvent(
                     kind="model_request",
                     payload={
@@ -140,7 +163,8 @@ class TravelAgent:
                         "tool_count": len(context.tools),
                         "dropped_messages": context.dropped_messages,
                     },
-                )
+                ),
+                session_id,
             )
 
             # 模型可能直接回答，也可能提出工具调用。
@@ -152,17 +176,27 @@ class TravelAgent:
 
             if isinstance(model_output, str):
                 # 只有文本回复可以成为最终答案。
-                events.append(
+                assistant_message = Message(
+                    role="assistant",
+                    content=model_output,
+                )
+                messages.append(assistant_message)
+                self._record_message(assistant_message, session_id)
+                self._record_event(
+                    events,
                     AgentEvent(
                         kind="model_response",
                         payload={"text": model_output},
-                    )
+                    ),
+                    session_id,
                 )
-                events.append(
+                self._record_event(
+                    events,
                     AgentEvent(
                         kind="run_finished",
                         payload={"status": "completed"},
-                    )
+                    ),
+                    session_id,
                 )
                 return AgentResult(
                     answer=model_output,
@@ -183,32 +217,63 @@ class TravelAgent:
 
             # 把模型的动作也放进消息历史。下一轮模型需要知道自己刚才
             # 请求了什么工具，否则工具结果会失去上下文。
-            messages.append(
-                Message(
-                    role="assistant",
-                    content="",
-                    tool_call=call,
-                )
+            assistant_message = Message(
+                role="assistant",
+                content="",
+                tool_call=call,
             )
-            events.append(
+            messages.append(assistant_message)
+            self._record_message(assistant_message, session_id)
+            call_id = (
+                self.session_store.next_tool_call_id(session_id)
+                if self.session_store is not None and session_id is not None
+                else f"call-{tool_rounds}"
+            )
+            self._record_event(
+                events,
                 AgentEvent(
                     kind="tool_requested",
                     payload={
+                        "call_id": call_id,
                         "name": call.name,
                         "arguments": call.arguments,
                     },
-                )
+                ),
+                session_id,
             )
 
             # Runtime 执行工具，而不是让模型直接执行 Python 函数。
             observation = self.registry.dispatch(call)
-            messages.append(Message(role="tool", content=observation))
-            events.append(
+            tool_message = Message(role="tool", content=observation)
+            messages.append(tool_message)
+            self._record_message(tool_message, session_id)
+            self._record_event(
+                events,
                 AgentEvent(
                     kind="tool_result",
                     payload={
+                        "call_id": call_id,
                         "name": call.name,
                         "content": observation,
                     },
-                )
+                ),
+                session_id,
             )
+
+    def _record_event(
+        self,
+        events: list[AgentEvent],
+        event: AgentEvent,
+        session_id: str | None,
+    ) -> None:
+        """同时写入本次结果和持久化事件表。"""
+
+        events.append(event)
+        if self.session_store is not None and session_id is not None:
+            self.session_store.append_event(session_id, event)
+
+    def _record_message(self, message: Message, session_id: str | None) -> None:
+        """在启用会话时保存一条新增消息。"""
+
+        if self.session_store is not None and session_id is not None:
+            self.session_store.append_message(session_id, message)

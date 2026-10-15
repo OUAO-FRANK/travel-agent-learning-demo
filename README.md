@@ -19,6 +19,13 @@ CLI 输入
 模型本轮真正收到的请求；Agent 内部的完整历史与这个请求窗口是两个不同概念。
 当前用消息数量做教学版预算，工具调用请求和工具结果会作为一轮整体保留。
 
+阶段 5 增加了可选的 `SQLiteSessionStore`。传入 `session_store` 和 `session_id`
+后，Agent 会保存 `sessions`、`messages`、`events` 和 `tool_calls`，重新创建
+Store 后可以继续同一会话的历史。CLI 通过 `--db` 和 `--session-id` 开启持久化；
+两项必须同时提供。运行前会打印恢复的历史消息、角色和内容，运行后会重新从数据库读取
+消息、事件和工具调用统计，方便观察“本轮发生了什么”和“已保存什么”。默认 CLI
+仍使用内存模式，避免不指定会话时把不同用户请求混在一起。
+
 当前版本支持两种模式：
 
 - `fake`：默认模式，不访问网络、不需要 API Key，结果确定；
@@ -78,6 +85,39 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m app `
   "我想下周去上海玩三天，预算 2000 元，喜欢历史景点"
 ```
 
+如果要观察 SQLite 会话持久化，先选一个数据库文件位置。下面把数据库放在用户数据目录，
+避免把本地实验数据放进 Git 仓库：
+
+```powershell
+$db = Join-Path $env:LOCALAPPDATA "TravelAgentLab\travel-agent.db"
+```
+
+第一次运行会新建数据库和会话：
+
+```powershell
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider deepseek `
+  --db $db `
+  --session-id shanghai-demo `
+  "我想下周去上海玩三天，喜欢历史景点"
+```
+
+再次使用相同的 `$db` 和 `--session-id`，程序会把前一轮消息恢复到模型上下文：
+
+```powershell
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider deepseek `
+  --db $db `
+  --session-id shanghai-demo `
+  "预算是 2000 元，请把路线安排得具体一些"
+```
+
+第二次运行的 `history_before_count` 应大于 0，`history_before_roles` 会显示已恢复的
+角色顺序。`persisted_message_count` 和 `persisted_event_count` 则是运行后重新从数据库
+读取的统计。要开始一个全新会话，换一个 `--session-id`；要从头开始整个实验，换一个 `$db`。
+使用 `--provider fake` 也能验证保存和恢复，但 FakeModel 的答案是预设文本，不会根据历史改变；
+想观察模型如何利用上一轮内容，请使用 DeepSeek 模式。
+
 如果你要显式使用旧名称 `deepseek-v4-flash`，只需改为：
 
 ```powershell
@@ -106,3 +146,5 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m unittest discover -v
 - 工具注册表是否拒绝未知工具、重复名称和非法参数；
 - Agent 是否通过注入的注册表执行自定义工具。
 - 上下文窗口是否保留 system prompt、完整工具回合，并正确记录被截断的历史。
+- SQLite 重新打开后是否能恢复消息、事件和工具调用证据。
+- CLI 是否能在重复使用同一数据库和 session ID 时恢复历史并显示持久化统计。

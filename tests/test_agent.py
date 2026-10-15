@@ -1,10 +1,13 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 from app.domain import AgentEvent, Message, ToolCall
 from app.agent import TravelAgent
 from app.context import ContextBuilder
 from app.model import FakeModel
 from app.tools import ToolDefinition, ToolRegistry
+from app.storage import SQLiteSessionStore
 
 
 class DomainTests(unittest.TestCase):
@@ -58,6 +61,68 @@ class FakeModelTests(unittest.TestCase):
 
 
 class TravelAgentTests(unittest.TestCase):
+    def test_run_can_resume_messages_from_a_persisted_session(self):
+        """第二个 Agent 进程应看到第一个 Agent 已保存的对话历史。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteSessionStore(Path(directory) / "travel-agent.db")
+
+            first_model = FakeModel(["第一轮计划已经完成。"])
+            TravelAgent(first_model, session_store=store).run(
+                "我想去上海",
+                session_id="trip-1",
+            )
+
+            second_model = FakeModel(["第二轮补充了预算。"])
+            result = TravelAgent(second_model, session_store=store).run(
+                "预算是 2000 元",
+                session_id="trip-1",
+            )
+
+            self.assertEqual(result.answer, "第二轮补充了预算。")
+            self.assertEqual(
+                second_model.requests[0],
+                [
+                    Message(role="system", content="你是旅行规划助手。"),
+                    Message(role="user", content="我想去上海"),
+                    Message(role="assistant", content="第一轮计划已经完成。"),
+                    Message(role="user", content="预算是 2000 元"),
+                ],
+            )
+
+    def test_repeated_persisted_tool_runs_get_distinct_call_ids(self):
+        """同一会话的多次工具调用不能复用同一个数据库主键。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteSessionStore(Path(directory) / "travel-agent.db")
+
+            first_model = FakeModel(
+                [
+                    ToolCall(name="get_weather", arguments={"city": "上海"}),
+                    "第一轮完成",
+                ]
+            )
+            TravelAgent(first_model, session_store=store).run(
+                "查上海天气",
+                session_id="trip-1",
+            )
+
+            second_model = FakeModel(
+                [
+                    ToolCall(name="get_weather", arguments={"city": "北京"}),
+                    "第二轮完成",
+                ]
+            )
+            TravelAgent(second_model, session_store=store).run(
+                "再查北京天气",
+                session_id="trip-1",
+            )
+
+            self.assertEqual(
+                [call["call_id"] for call in store.load_tool_calls("trip-1")],
+                ["call-1", "call-2"],
+            )
+
     def test_run_uses_context_builder_for_model_request_metadata(self):
         """Agent 事件应记录实际上下文窗口，而不是内部完整历史。"""
 

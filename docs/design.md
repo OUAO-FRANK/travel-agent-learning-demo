@@ -301,13 +301,14 @@ API key 只写入当前 PowerShell 进程环境。也可以写入用户级环境
 - `events`：运行轨迹；
 - `tool_calls`：工具请求和结果；
 - `session_id` 贯穿一次运行；
-- 中断后重新加载消息继续执行。
+- 重新创建 Store 后重新加载消息继续执行；
+- 当前先支持“按历史恢复下一轮”，真正的中断 checkpoint、幂等恢复和写操作重放留到 Harness 阶段。
 
 **必须理解**：持久化历史、单次运行状态、事件日志三者不同。
 
 **失败实验**：只保存最终答案，尝试恢复工具调用上下文，说明为什么失败。
 
-**验收证据**：运行中断、重新启动、读取数据库、继续请求。
+**验收证据**：关闭并重新创建 Store，读取数据库中的消息/事件/工具证据，再用同一 `session_id` 继续请求。
 
 **Hermes 对照**：对应 Session DB、session persistence、turn finalizer。
 
@@ -535,6 +536,8 @@ AI 不自动 commit 或 push。每次提交前先展示变更摘要，由用户�
 - 阶段 3 的 Provider 核心：`ModelProvider`、OpenAI-compatible 转换和测试；
 - DeepSeek 配置入口：`--provider deepseek`、`DEEPSEEK_API_KEY`、默认 `deepseek-flash`。
 - 阶段 4：`ContextBuilder`、消息预算、完整工具回合保留和上下文观测事件。
+- 阶段 5：SQLite `sessions`、`messages`、`events`、`tool_calls`，以及同一 `session_id` 的历史恢复。
+- 阶段 5 CLI：可选 `--db` 和 `--session-id` 参数；运行前显示恢复到的消息数量和角色，运行后重新读取并显示持久化统计。
 
 当前正在完成：
 
@@ -542,11 +545,18 @@ AI 不自动 commit 或 push。每次提交前先展示变更摘要，由用户�
 - 观察真实模型的文本响应和工具调用响应；
 - 记录真实 API 的错误形状、调用成本和模型行为，不把它们混入 FakeModel 的确定性测试。
 
+当前阶段边界：
+
+- SQLite 先使用标准库直接操作，暂不引入 ORM、迁移工具或并发队列；
+- 当前恢复的是已保存的消息历史，不是任意中断点的自动重放；
+- CLI 默认仍保持内存运行；只有同时传入 `--db` 和 `--session-id` 才使用 SQLite；
+- 每个会话的工具调用 ID 根据已有持久化记录递增，避免跨进程继续会话时发生主键冲突。
+
 下一阶段：
 
-- SQLite 会话持久化；
-- 保存 sessions、messages、events 和 tool_calls；
-- 验证进程重启后的会话恢复。
+- 最小 RAG；
+- 文档切分、关键词召回和来源引用；
+- 将检索证据注入上下文，但不把 RAG 混同为 Memory。
 
 ## 8. 每阶段验收总标准
 
