@@ -6,6 +6,7 @@ from app.domain import AgentEvent, Message, ToolCall
 from app.agent import TravelAgent
 from app.context import ContextBuilder
 from app.model import FakeModel
+from app.summarizer import LLMConversationSummarizer
 from app.tools import ToolDefinition, ToolRegistry
 from app.storage import SQLiteSessionStore
 
@@ -61,6 +62,133 @@ class FakeModelTests(unittest.TestCase):
 
 
 class TravelAgentTests(unittest.TestCase):
+    def test_run_summarizes_old_turns_and_keeps_raw_database_messages(self):
+        """Agent 压缩模型上下文，但不删除 SQLite 中的原始消息。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteSessionStore(Path(directory) / "travel-agent.db")
+
+            # 两轮旧历史先照常写进数据库；这两次运行尚未启用消息预算。
+            for user_text, answer in [
+                (
+                    "我计划下周去上海玩三天，特别喜欢历史景点，尽量不要安排太早的行程。",
+                    "收到，我会安排一个轻松的路线。",
+                ),
+                (
+                    "整个旅行预算控制在 2000 元以内，我不吃辣，优先选择地铁方便的路线。",
+                    "记下预算和饮食偏好。",
+                ),
+            ]:
+                TravelAgent(FakeModel([answer]), session_store=store).run(
+                    user_text,
+                    session_id="trip-1",
+                )
+
+            model = FakeModel(
+                [
+                    "这是加入历史摘要后的路线建议。",
+                ]
+            )
+            summary_model = FakeModel(
+                [
+                    "用户计划下周去上海三天，喜欢历史景点，预算 2000 元；不吃辣，偏好地铁方便的路线。",
+                ]
+            )
+            agent = TravelAgent(
+                model,
+                context_builder=ContextBuilder(
+                    max_messages=4,
+                    enable_compression=True,
+                ),
+                session_store=store,
+                summarizer=LLMConversationSummarizer(summary_model),
+            )
+
+            result = agent.run("请把路线按天安排", session_id="trip-1")
+
+            self.assertEqual(
+                [event.kind for event in result.events],
+                [
+                    "user_input",
+                    "context_compression_started",
+                    "context_summary_requested",
+                    "context_compressed",
+                    "model_request",
+                    "model_response",
+                    "run_finished",
+                ],
+            )
+            self.assertEqual(len(model.requests), 1)
+            self.assertEqual(len(summary_model.requests), 1)
+            self.assertEqual(
+                [message.role for message in summary_model.requests[0]][0],
+                "system",
+            )
+            self.assertEqual(summary_model.tool_requests, [[]])
+            self.assertEqual(
+                [message.role for message in model.requests[0]],
+                ["system", "assistant", "user"],
+            )
+            self.assertIn("喜欢历史景点", model.requests[0][1].content)
+            self.assertIn("2000 元", model.requests[0][1].content)
+            self.assertEqual(
+                len(store.load_messages("trip-1")),
+                6,
+                "SQLite 仍保存原始对话，不保存被压缩后的替代内容",
+            )
+
+    def test_tool_round_can_trigger_compression_before_second_model_request(self):
+        """工具结果增加消息后，第二次模型请求也应重新检查预算。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteSessionStore(Path(directory) / "travel-agent.db")
+            TravelAgent(
+                FakeModel(["上一轮已记录上海行程。"]),
+                session_store=store,
+            ).run("我准备去上海", session_id="trip-1")
+
+            model = FakeModel(
+                [
+                    ToolCall(name="get_weather", arguments={"city": "上海"}),
+                    "今天适合游览历史街区。",
+                ]
+            )
+            summary_model = FakeModel(["用户准备去上海；工具结果显示上海晴，25°C。"])
+            agent = TravelAgent(
+                model,
+                context_builder=ContextBuilder(
+                    max_messages=4,
+                    enable_compression=True,
+                ),
+                session_store=store,
+                summarizer=LLMConversationSummarizer(summary_model),
+            )
+
+            result = agent.run("请查上海天气", session_id="trip-1")
+
+            self.assertEqual(
+                [event.kind for event in result.events],
+                [
+                    "user_input",
+                    "model_request",
+                    "tool_requested",
+                    "tool_result",
+                    "context_compression_started",
+                    "context_summary_requested",
+                    "context_compressed",
+                    "model_request",
+                    "model_response",
+                    "run_finished",
+                ],
+            )
+            self.assertEqual(
+                [message.role for message in model.requests[1]],
+                ["system", "assistant", "user", "assistant", "tool"],
+            )
+            self.assertIn("准备去上海", model.requests[1][1].content)
+            self.assertEqual(len(summary_model.requests), 1)
+            self.assertEqual(model.requests[1][-1].content, "上海：晴，25°C")
+
     def test_run_can_resume_messages_from_a_persisted_session(self):
         """第二个 Agent 进程应看到第一个 Agent 已保存的对话历史。"""
 

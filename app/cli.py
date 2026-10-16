@@ -15,8 +15,10 @@ import sys
 
 from app.agent import TravelAgent
 from app.config import ConfigurationError, load_model_config
+from app.context import ContextBuilder
 from app.model import FakeModel, ModelProviderError, OpenAICompatibleModel
 from app.storage import SQLiteSessionStore
+from app.summarizer import ExtractiveSummarizer, LLMConversationSummarizer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +48,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--session-id",
         help="要恢复或继续的会话 ID；必须和 --db 一起使用",
     )
+    parser.add_argument(
+        "--max-messages",
+        type=int,
+        help="模型上下文最多保留的消息数量；需要压缩时和 --compress-context 一起使用",
+    )
+    parser.add_argument(
+        "--compress-context",
+        action="store_true",
+        help="超出消息预算时，用摘要替代较早对话轮次",
+    )
     return parser
 
 
@@ -74,6 +86,15 @@ def main(
     # 这样用户不会误以为消息已经保存，却实际上没有稳定的会话键。
     if (args.db is None) != (args.session_id is None):
         parser.error("--db and --session-id must be provided together")
+
+    try:
+        context_builder = ContextBuilder(
+            system_prompt=TravelAgent.SYSTEM_PROMPT,
+            max_messages=args.max_messages,
+            enable_compression=args.compress_context,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     session_store = (
         SQLiteSessionStore(args.db)
@@ -123,7 +144,20 @@ def main(
             model=config.model or "",
         )
 
-    agent = TravelAgent(model, session_store=session_store)
+    # 真实模型模式下，压缩也使用一次 LLM；Fake 模式使用本地摘要，
+    # 这样离线 CLI 和自动化测试不会因为摘要额外消耗网络额度。
+    summarizer = (
+        LLMConversationSummarizer(model)
+        if config.provider == "deepseek"
+        else ExtractiveSummarizer()
+    )
+
+    agent = TravelAgent(
+        model,
+        context_builder=context_builder,
+        session_store=session_store,
+        summarizer=summarizer,
+    )
     try:
         result = agent.run(args.user_text, session_id=args.session_id)
     except ModelProviderError as exc:

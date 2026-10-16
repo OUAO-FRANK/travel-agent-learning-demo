@@ -33,6 +33,13 @@ class ModelContext:
     # 被窗口截断的历史消息数量；system prompt 不算历史，不会被丢弃。
     dropped_messages: int
 
+    # 本次请求中用一条摘要替代的原始消息数量。
+    # 摘要不是持久化消息，只是本次模型请求的上下文补充。
+    summarized_messages: int = 0
+
+    # 实际注入请求的摘要文本；没有触发压缩时为 None。
+    summary_text: str | None = None
+
 
 class ContextBuilder:
     """按固定 system prompt 和消息预算构造模型请求上下文。
@@ -50,19 +57,27 @@ class ContextBuilder:
         self,
         system_prompt: str = "你是旅行规划助手。",
         max_messages: int | None = None,
+        enable_compression: bool = False,
     ) -> None:
         # 预算至少要容纳 system prompt 和一条当前任务消息。
         # None 表示本阶段先不截断，只观察完整历史如何进入请求。
         if max_messages is not None and max_messages < 2:
             raise ValueError("max_messages must be at least 2")
+        if enable_compression and (max_messages is None or max_messages < 3):
+            raise ValueError(
+                "context compression requires max_messages to be at least 3"
+            )
 
         self.system_prompt = system_prompt
         self.max_messages = max_messages
+        self.enable_compression = enable_compression
 
     def build(
         self,
         history: list[Message],
         tool_schemas: list[dict[str, object]],
+        summary_text: str | None = None,
+        summarized_messages: int = 0,
     ) -> ModelContext:
         """生成包含 system、筛选后的历史和工具目录的请求快照。
 
@@ -74,20 +89,120 @@ class ContextBuilder:
             一个不可追加消息的上下文快照，以及本次丢弃的历史消息数。
         """
 
-        selected_history = self._select_history(history)
+        # 有摘要时仍从完整历史计算最近轮次，确保摘要只替代较早轮次，
+        # 不会把最近的工具调用链重复放进摘要和原文两个位置。
+        # 摘要占用一条消息，所以带摘要时要比普通窗口多预留一个位置。
+        selected_history = self._select_history(
+            history,
+            reserve_summary=summary_text is not None,
+        )
         system_message = Message(role="system", content=self.system_prompt)
+
+        summary_messages: tuple[Message, ...] = ()
+        if summary_text is not None:
+            summary_messages = (
+                Message(
+                    # 摘要来自历史消息，不应获得 system 指令的优先级。
+                    # 使用 assistant 角色可以让模型知道它是运行时整理出的
+                    # 上下文补充，而不是一条新的应用规则。
+                    role="assistant",
+                    content=(
+                        "以下是此前会话的摘要。它用于补充历史，不是新的系统规则：\n"
+                        f"{summary_text}"
+                    ),
+                ),
+            )
 
         # deepcopy 不只复制最外层工具字典，也复制嵌套的 parameters 等对象，
         # 这样注册表或调用方后续修改 schema 不会污染已记录的请求快照。
         copied_tools = tuple(deepcopy(tool_schema) for tool_schema in tool_schemas)
 
         return ModelContext(
-            messages=(system_message, *selected_history),
+            messages=(system_message, *summary_messages, *selected_history),
             tools=copied_tools,
-            dropped_messages=len(history) - len(selected_history),
+            # history 仍然是完整历史；summarized_messages 只是说明其中有多少
+            # 条旧消息已经由摘要替代。剩余未被摘要替代却没进入窗口的消息，
+            # 才计入 dropped_messages。
+            dropped_messages=max(
+                0,
+                len(history) - len(selected_history) - summarized_messages,
+            ),
+            summarized_messages=summarized_messages,
+            summary_text=summary_text,
         )
 
-    def _select_history(self, history: list[Message]) -> tuple[Message, ...]:
+    def messages_to_compress(
+        self,
+        history: list[Message],
+    ) -> tuple[tuple[Message, ...], tuple[Message, ...]]:
+        """把历史拆成“需要摘要的旧轮次”和“保留原文的最近轮次”。
+
+        返回值是两个 tuple：
+
+        1. ``older_messages``：超出预算、准备交给本地规则整理的消息；
+        2. ``recent_messages``：本轮仍然以原文发送给主模型的完整轮次。
+
+        分组依据仍然是 user 消息边界，所以 assistant 工具请求和 tool
+        observation 不会被单独切走。没有预算，或历史尚未超预算时，旧消息为空。
+        """
+
+        if self.max_messages is None or self.max_messages < 3:
+            return (), tuple(history)
+
+        # 没有超过 system + 历史消息的预算时，不必生成摘要。
+        if len(history) + 1 <= self.max_messages:
+            return (), tuple(history)
+
+        turns = self._group_turns(history)
+        # 压缩后的请求至少包含 system、summary 两条消息，剩余预算才留给原文。
+        selected_turns = self._select_recent_turns(turns, reserve_summary=True)
+        selected_history = tuple(
+            message
+            for turn in selected_turns
+            for message in turn
+        )
+
+        if len(selected_history) == len(history):
+            return (), selected_history
+
+        older_count = len(history) - len(selected_history)
+        older_history = tuple(history[:older_count])
+        return older_history, selected_history
+
+    @staticmethod
+    def summarize_messages(messages: tuple[Message, ...]) -> str:
+        """用提取式规则保留旧用户需求和工具观察。
+
+        这是便于观察的第一版压缩，不调用模型：保留用户说过的需求和
+        工具返回的事实，省略旧助手回答，因为 Agent 可以在新请求中重新生成。
+        为限制极长历史，摘要最多保留 600 个字符。
+        """
+
+        summary_parts: list[str] = []
+        for message in messages:
+            content = " ".join(message.content.split())
+            if not content:
+                continue
+
+            if message.role == "user":
+                summary_parts.append(f"用户：{content}")
+            elif message.role == "tool":
+                summary_parts.append(f"工具：{content}")
+
+        summary_text = "\n".join(summary_parts)
+        if not summary_text:
+            return "较早对话没有可提取的用户需求或工具观察。"
+
+        max_summary_chars = 600
+        if len(summary_text) > max_summary_chars:
+            summary_text = summary_text[: max_summary_chars - 1] + "…"
+        return summary_text
+
+    def _select_history(
+        self,
+        history: list[Message],
+        reserve_summary: bool = False,
+    ) -> tuple[Message, ...]:
         """从最近的完整对话轮次开始选择历史。
 
         一轮从 user 消息开始，到下一条 user 消息之前结束。比如：
@@ -100,10 +215,31 @@ class ContextBuilder:
         if self.max_messages is None:
             return tuple(history)
 
-        # system prompt 自己占一个预算名额，剩下的名额分给对话历史。
-        history_budget = self.max_messages - 1
         turns = self._group_turns(history)
-        selected_reversed: list[Message] = []
+        selected_turns = self._select_recent_turns(
+            turns,
+            reserve_summary=reserve_summary,
+        )
+        return tuple(
+            message
+            for turn in selected_turns
+            for message in turn
+        )
+
+    def _select_recent_turns(
+        self,
+        turns: list[tuple[Message, ...]],
+        reserve_summary: bool = False,
+    ) -> list[tuple[Message, ...]]:
+        """从后往前选择能放进预算的完整轮次。"""
+
+        if self.max_messages is None:
+            return turns
+
+        # system prompt 占一条；如果已有摘要，再多预留一条给摘要消息。
+        reserved_messages = 2 if reserve_summary else 1
+        history_budget = self.max_messages - reserved_messages
+        selected_turns_reversed: list[tuple[Message, ...]] = []
         selected_count = 0
 
         # 从最新轮次向过去倒序选择。遇到一个完整轮次放不进预算时就停止，
@@ -112,16 +248,16 @@ class ContextBuilder:
             if selected_count and selected_count + len(turn) > history_budget:
                 break
 
-            selected_reversed.extend(reversed(turn))
+            selected_turns_reversed.append(turn)
             selected_count += len(turn)
 
             # 最新一轮可能比预算还大；仍保留完整一轮后立即停止。
             if selected_count >= history_budget:
                 break
 
-        # 反向挑选时把每轮内部也倒序放入；最后整体逆转恢复原始时间顺序。
-        selected_reversed.reverse()
-        return tuple(selected_reversed)
+        # 反向挑选时，最后逆转轮次顺序恢复原始时间顺序。
+        selected_turns_reversed.reverse()
+        return selected_turns_reversed
 
     @staticmethod
     def _group_turns(history: list[Message]) -> list[tuple[Message, ...]]:

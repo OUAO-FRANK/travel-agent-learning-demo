@@ -130,6 +130,7 @@ Memory：保存和回忆用户/Agent 的长期信息
 | 3 | 模型适配与真实 DeepSeek | Provider、请求转换、响应解析、配置 | `model.py`、`config.py`、`cli.py` | Fake/DeepSeek 可切换 |
 | 4 | Prompt 与上下文 | system prompt、历史、工具目录、预算 | `context.py`、`agent.py` | 能解释“实际发给模型什么” |
 | 5 | SQLite 会话持久化 | sessions、messages、events、tool calls | `storage.py` | 中断后恢复对话 |
+| 5.5 | 上下文压缩 | 旧轮次摘要、最近轮次保留、压缩事件 | `context.py`、`agent.py`、`cli.py` | 长会话保留关键信息 |
 | 6 | 最小 RAG | 文档、切分、关键词召回、引用 | `rag.py` | 依据来自资料而不是猜测 |
 | 7 | Memory | 偏好写入、搜索、召回、过期 | `memory.py` | 长期信息和 RAG 分离 |
 | 8 | 多工具队列 | 串行、并行、取消、失败策略 | `queue.py`、`agent.py` | 多个能力可控执行 |
@@ -311,6 +312,44 @@ API key 只写入当前 PowerShell 进程环境。也可以写入用户级环境
 **验收证据**：关闭并重新创建 Store，读取数据库中的消息/事件/工具证据，再用同一 `session_id` 继续请求。
 
 **Hermes 对照**：对应 Session DB、session persistence、turn finalizer。
+
+### 阶段 5.5：上下文压缩
+
+**目的**：区分“把旧消息直接丢掉”和“把旧消息整理成摘要后继续使用”。
+
+**数据流**：
+
+```text
+SQLite / Agent 完整历史
+  -> 按 user 边界划分完整对话轮次
+  -> 最近轮次保持原文
+  -> 较早轮次提取用户需求和工具观察
+  -> system + summary + recent history 进入本次模型请求
+```
+
+**实现增量**：
+
+- `ContextBuilder.messages_to_compress()`：找出可压缩的旧轮次；
+- `ContextBuilder.summarize_messages()`：确定性地保留旧用户需求和工具观察，省略旧助手回答；
+- `TravelAgent`：记录 `context_compression_started` 和 `context_compressed`；
+- CLI：`--max-messages` 和 `--compress-context` 用于直接观察压缩；
+- SQLite：原始对话消息照常保留；摘要不写入 `messages`，但压缩事件会把摘要正文作为运行证据写入 `events`。
+
+**必须理解**：截断会丢弃旧消息；压缩会用一条摘要替代旧消息。摘要不等于 Memory，
+完整历史不等于实际发给模型的窗口。旧工具调用和工具结果一起进入摘要范围，最新工具
+回合保持原文。
+
+**失败实验**：保留 `--max-messages 4`、去掉 `--compress-context`，观察
+`dropped_messages`；重新打开压缩后，比较 `summarized_messages` 和摘要内容。
+
+**验收证据**：同一会话连续运行三次；第三次出现压缩事件，模型请求包含历史摘要，
+`persisted_message_count` 仍包含所有原始 user/assistant 消息。
+
+**边界**：当前摘要由本地提取规则生成，不调用额外模型；token 预算、模型生成摘要、摘要
+版本管理和中断恢复仍留给后续课程。摘要正文目前只随压缩事件保存在 `events`，不作为
+独立可恢复状态或 `messages` 记录。
+
+**Hermes 对照**：对应上下文预算、消息压缩、请求前预处理和压缩状态记录。
 
 ### 阶段 6：最小 RAG
 
@@ -538,8 +577,9 @@ AI 不自动 commit 或 push。每次提交前先展示变更摘要，由用户�
 - 阶段 4：`ContextBuilder`、消息预算、完整工具回合保留和上下文观测事件。
 - 阶段 5：SQLite `sessions`、`messages`、`events`、`tool_calls`，以及同一 `session_id` 的历史恢复。
 - 阶段 5 CLI：可选 `--db` 和 `--session-id` 参数；运行前显示恢复到的消息数量和角色，运行后重新读取并显示持久化统计。
+- 阶段 5.5：本地规则上下文压缩、压缩事件和 CLI 可观察实验。
 
-当前正在完成：
+当前可运行：
 
 - 由学习者填入 API key 后，使用真实 DeepSeek 运行一次旅行规划请求；
 - 观察真实模型的文本响应和工具调用响应；
@@ -551,6 +591,7 @@ AI 不自动 commit 或 push。每次提交前先展示变更摘要，由用户�
 - 当前恢复的是已保存的消息历史，不是任意中断点的自动重放；
 - CLI 默认仍保持内存运行；只有同时传入 `--db` 和 `--session-id` 才使用 SQLite；
 - 每个会话的工具调用 ID 根据已有持久化记录递增，避免跨进程继续会话时发生主键冲突。
+- 当前压缩只改变模型请求窗口，不删除 SQLite 原始消息；摘要由本地规则生成，不产生额外 API 调用。
 
 下一阶段：
 

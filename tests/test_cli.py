@@ -71,6 +71,35 @@ class CliTests(unittest.TestCase):
             self.assertIn("persisted_event_count=4", printed)
             self.assertIn("persisted_tool_call_count=0", printed)
 
+    def test_main_can_enable_context_compression(self):
+        """CLI 应允许设置小消息预算来直接观察上下文压缩。"""
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "travel-agent.db"
+            output = io.StringIO()
+            common_arguments = [
+                "--db",
+                str(database_path),
+                "--session-id",
+                "trip-1",
+                "--max-messages",
+                "4",
+                "--compress-context",
+            ]
+
+            with redirect_stdout(output):
+                first_exit_code = main([*common_arguments, "我想去上海三天"])
+                second_exit_code = main([*common_arguments, "预算是 2000 元"])
+                third_exit_code = main([*common_arguments, "请把路线按天安排"])
+
+            printed = output.getvalue()
+
+            self.assertEqual((first_exit_code, second_exit_code, third_exit_code), (0, 0, 0))
+            self.assertIn("event=context_compression_started", printed)
+            self.assertIn("event=context_compressed", printed)
+            self.assertIn("'compressed_messages': 4", printed)
+            self.assertIn("'max_messages': 4", printed)
+
     def test_main_restores_history_when_reusing_session_id(self):
         """第二次 CLI 运行应从数据库恢复第一次运行的消息。"""
 

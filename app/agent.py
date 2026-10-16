@@ -19,6 +19,7 @@ from app.context import ContextBuilder
 from app.domain import AgentEvent, Message, ToolCall
 from app.model import ModelProvider
 from app.storage import SQLiteSessionStore
+from app.summarizer import ConversationSummarizer, ExtractiveSummarizer
 from app.tools import ToolRegistry, build_default_registry
 
 
@@ -64,6 +65,7 @@ class TravelAgent:
         registry: ToolRegistry | None = None,
         context_builder: ContextBuilder | None = None,
         session_store: SQLiteSessionStore | None = None,
+        summarizer: ConversationSummarizer | None = None,
     ) -> None:
         # 保存模型依赖，但不复制或修改模型对象。
         # Agent 负责流程，具体的 ModelProvider 实现负责产生模型回复。
@@ -90,6 +92,12 @@ class TravelAgent:
         # FakeModel 测试和 CLI 示例必须创建数据库；传入它才开启持久化。
         self.session_store = session_store
 
+        # 摘要器也通过依赖注入传入。默认使用本地规则，保证早期测试不需要
+        # 网络；CLI 在真实 DeepSeek 模式下会显式注入 LLM 摘要器。
+        self.summarizer = (
+            ExtractiveSummarizer() if summarizer is None else summarizer
+        )
+
     def run(
         self,
         user_text: str,
@@ -100,8 +108,8 @@ class TravelAgent:
         数据流按以下顺序发生：
 
         1. 创建事件列表，并记录原始用户输入；
-        2. 组装本次发给模型的消息；
-        3. 调用模型；
+        2. 读取历史，必要时生成仅供本轮请求使用的摘要；
+        3. 组装本次发给模型的消息并调用模型；
         4. 如果得到 ToolCall，执行工具并追加 assistant/tool 消息；
         5. 再次请求模型，直到得到最终文本；
         6. 记录模型响应和运行完成事件；
@@ -142,13 +150,77 @@ class TravelAgent:
         messages.append(user_message)
         self._record_message(user_message, session_id)
 
+        # 压缩只改变“本轮发给模型的窗口”，不修改 messages，也不删除
+        # SQLite 中的原始历史。当前版本使用确定性的本地规则生成摘要，
+        # 因此不会额外消耗模型调用；将来可以替换成独立摘要模型。
+        #
+        # 这两个变量跨模型请求保留：Agent 可能先请求工具，工具结果又会
+        # 增加消息数量，所以第二次模型请求前可能需要扩大摘要覆盖范围。
+        summary_text: str | None = None
+        summarized_messages = 0
+
         tool_rounds = 0
 
         while True:
+            # 每次模型请求前都重新检查预算，而不是只在 run() 开始时检查。
+            # 原因是一次工具往返会追加 assistant(tool_call) 和 tool 两条消息；
+            # 第一轮尚未超预算，不代表拿到工具结果后的第二轮仍未超预算。
+            if self.context_builder.enable_compression:
+                older_messages, _ = self.context_builder.messages_to_compress(messages)
+                # 只在摘要覆盖范围扩大时重新生成，避免同一轮重复记录压缩事件。
+                if len(older_messages) > summarized_messages:
+                    summarized_messages = len(older_messages)
+                    source_characters = sum(
+                        len(message.content) for message in older_messages
+                    )
+                    self._record_event(
+                        events,
+                        AgentEvent(
+                            kind="context_compression_started",
+                            payload={
+                                "compressed_messages": summarized_messages,
+                                "max_messages": self.context_builder.max_messages,
+                                "source_characters": source_characters,
+                            },
+                        ),
+                        session_id,
+                    )
+                    self._record_event(
+                        events,
+                        AgentEvent(
+                            kind="context_summary_requested",
+                            payload={
+                                "compressed_messages": summarized_messages,
+                                "source_characters": source_characters,
+                            },
+                        ),
+                        session_id,
+                    )
+                    summary_text = self.summarizer.summarize(older_messages)
+                    self._record_event(
+                        events,
+                        AgentEvent(
+                            kind="context_compressed",
+                            payload={
+                                "compressed_messages": summarized_messages,
+                                "max_messages": self.context_builder.max_messages,
+                                "source_characters": source_characters,
+                                "summary_characters": len(summary_text),
+                                "summary": summary_text,
+                            },
+                        ),
+                        session_id,
+                    )
+
             # 每次请求都从当前注册表获取工具目录，再与对话历史一起交给
             # ContextBuilder。ContextBuilder 的输出才是实际发送给模型的窗口。
             tool_schemas = self.registry.model_schemas()
-            context = self.context_builder.build(messages, tool_schemas)
+            context = self.context_builder.build(
+                messages,
+                tool_schemas,
+                summary_text=summary_text,
+                summarized_messages=summarized_messages,
+            )
 
             # 每次请求模型前都记录消息摘要。
             # 第二次请求会包含 assistant 的 ToolCall 和 tool observation，
@@ -162,6 +234,7 @@ class TravelAgent:
                         "roles": [message.role for message in context.messages],
                         "tool_count": len(context.tools),
                         "dropped_messages": context.dropped_messages,
+                        "summarized_messages": context.summarized_messages,
                     },
                 ),
                 session_id,
