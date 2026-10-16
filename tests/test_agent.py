@@ -6,6 +6,7 @@ from app.domain import AgentEvent, Message, ToolCall
 from app.agent import TravelAgent
 from app.context import ContextBuilder
 from app.model import FakeModel
+from app.rag import KeywordRetriever
 from app.summarizer import LLMConversationSummarizer
 from app.tools import ToolDefinition, ToolRegistry
 from app.storage import SQLiteSessionStore
@@ -62,6 +63,34 @@ class FakeModelTests(unittest.TestCase):
 
 
 class TravelAgentTests(unittest.TestCase):
+    def test_run_retrieves_evidence_and_injects_it_into_model_context(self):
+        model = FakeModel(["根据资料，上海外滩适合安排在晚上。"])
+        retriever = KeywordRetriever.from_text(
+            "上海外滩适合夜景，建议晚上前往。\n\n杭州西湖适合散步。",
+            source="travel-notes.md",
+        )
+
+        result = TravelAgent(model, retriever=retriever).run("上海夜景怎么安排")
+
+        self.assertEqual(result.answer, "根据资料，上海外滩适合安排在晚上。")
+        self.assertEqual(
+            [event.kind for event in result.events],
+            [
+                "user_input",
+                "rag_search_started",
+                "rag_search_completed",
+                "model_request",
+                "model_response",
+                "run_finished",
+            ],
+        )
+        self.assertEqual(
+            [message.role for message in model.requests[0]],
+            ["system", "assistant", "user"],
+        )
+        self.assertIn("travel-notes.md:0", model.requests[0][1].content)
+        self.assertIn("上海外滩适合夜景", model.requests[0][1].content)
+
     def test_run_summarizes_old_turns_and_keeps_raw_database_messages(self):
         """Agent 压缩模型上下文，但不删除 SQLite 中的原始消息。"""
 

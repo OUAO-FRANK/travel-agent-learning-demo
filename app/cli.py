@@ -17,6 +17,7 @@ from app.agent import TravelAgent
 from app.config import ConfigurationError, load_model_config
 from app.context import ContextBuilder
 from app.model import FakeModel, ModelProviderError, OpenAICompatibleModel
+from app.rag import KeywordRetriever
 from app.storage import SQLiteSessionStore
 from app.summarizer import ExtractiveSummarizer, LLMConversationSummarizer
 
@@ -58,6 +59,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="超出消息预算时，用摘要替代较早对话轮次",
     )
+    parser.add_argument(
+        "--knowledge-base",
+        type=Path,
+        help="本地旅行资料文件；提供后启用关键词 RAG",
+    )
+    parser.add_argument(
+        "--rag-top-k",
+        type=int,
+        default=3,
+        help="RAG 最多注入多少个资料片段，默认 3",
+    )
     return parser
 
 
@@ -95,6 +107,17 @@ def main(
         )
     except ValueError as exc:
         parser.error(str(exc))
+
+    retriever = None
+    if args.knowledge_base is not None:
+        try:
+            knowledge_text = args.knowledge_base.read_text(encoding="utf-8")
+        except OSError as exc:
+            parser.error(f"cannot read knowledge base: {exc}")
+        retriever = KeywordRetriever.from_text(
+            knowledge_text,
+            source=args.knowledge_base.name,
+        )
 
     session_store = (
         SQLiteSessionStore(args.db)
@@ -157,6 +180,8 @@ def main(
         context_builder=context_builder,
         session_store=session_store,
         summarizer=summarizer,
+        retriever=retriever,
+        rag_top_k=args.rag_top_k,
     )
     try:
         result = agent.run(args.user_text, session_id=args.session_id)

@@ -131,7 +131,7 @@ Memory：保存和回忆用户/Agent 的长期信息
 | 4 | Prompt 与上下文 | system prompt、历史、工具目录、预算 | `context.py`、`agent.py` | 能解释“实际发给模型什么” |
 | 5 | SQLite 会话持久化 | sessions、messages、events、tool calls | `storage.py` | 中断后恢复对话 |
 | 5.5 | 上下文压缩 | 旧轮次摘要、最近轮次保留、压缩事件 | `context.py`、`agent.py`、`cli.py` | 长会话保留关键信息 |
-| 6 | 最小 RAG | 文档、切分、关键词召回、引用 | `rag.py` | 依据来自资料而不是猜测 |
+| 6 | 最小 RAG | 文档、切分、关键词召回、引用 | `rag.py`、`data/travel_notes.md` | 依据来自资料而不是猜测 |
 | 7 | Memory | 偏好写入、搜索、召回、过期 | `memory.py` | 长期信息和 RAG 分离 |
 | 8 | 多工具队列 | 串行、并行、取消、失败策略 | `queue.py`、`agent.py` | 多个能力可控执行 |
 | 9 | Runtime Harness | 超时、预算、重试、中断、checkpoint | `harness.py` | 运行可控、可恢复 |
@@ -323,15 +323,17 @@ API key 只写入当前 PowerShell 进程环境。也可以写入用户级环境
 SQLite / Agent 完整历史
   -> 按 user 边界划分完整对话轮次
   -> 最近轮次保持原文
-  -> 较早轮次提取用户需求和工具观察
-  -> system + summary + recent history 进入本次模型请求
+  -> 较早轮次交给摘要器（Fake 本地规则 / DeepSeek LLM）
+  -> system + summary + RAG evidence + recent history 进入本次模型请求
 ```
 
 **实现增量**：
 
 - `ContextBuilder.messages_to_compress()`：找出可压缩的旧轮次；
-- `ContextBuilder.summarize_messages()`：确定性地保留旧用户需求和工具观察，省略旧助手回答；
-- `TravelAgent`：记录 `context_compression_started` 和 `context_compressed`；
+- `ConversationSummarizer`：统一摘要接口；
+- `ExtractiveSummarizer`：Fake 模式使用的确定性摘要；
+- `LLMConversationSummarizer`：DeepSeek 模式使用的模型摘要；
+- `TravelAgent`：记录 `context_compression_started`、`context_summary_requested` 和 `context_compressed`；
 - CLI：`--max-messages` 和 `--compress-context` 用于直接观察压缩；
 - SQLite：原始对话消息照常保留；摘要不写入 `messages`，但压缩事件会把摘要正文作为运行证据写入 `events`。
 
@@ -345,9 +347,9 @@ SQLite / Agent 完整历史
 **验收证据**：同一会话连续运行三次；第三次出现压缩事件，模型请求包含历史摘要，
 `persisted_message_count` 仍包含所有原始 user/assistant 消息。
 
-**边界**：当前摘要由本地提取规则生成，不调用额外模型；token 预算、模型生成摘要、摘要
-版本管理和中断恢复仍留给后续课程。摘要正文目前只随压缩事件保存在 `events`，不作为
-独立可恢复状态或 `messages` 记录。
+**边界**：Fake 模式使用本地提取规则，DeepSeek 模式使用额外的 LLM 摘要请求；token
+预算、摘要版本管理和中断恢复仍留给后续课程。摘要正文目前只随压缩事件保存在
+`events`，不作为独立可恢复状态或 `messages` 记录。
 
 **Hermes 对照**：对应上下文预算、消息压缩、请求前预处理和压缩状态记录。
 
@@ -363,6 +365,10 @@ SQLite / Agent 完整历史
 - top-k 结果；
 - 片段 ID 和来源引用；
 - 检索结果注入上下文。
+- `KeywordRetriever`：按关键词重叠数量返回 top-k；
+- `TravelAgent`：记录 `rag_search_started` 和 `rag_search_completed`；
+- CLI：`--knowledge-base` 和 `--rag-top-k`；
+- 示例资料库：`data/travel_notes.md`。
 
 **必须理解**：切分、索引、召回、证据、未命中；RAG 是找资料，不是保存用户偏好。
 
@@ -371,6 +377,9 @@ SQLite / Agent 完整历史
 **验收证据**：固定文档的命中、未命中和引用测试。
 
 **后置增强**：向量 embedding、向量数据库、混合检索和 rerank。
+
+**当前实现边界**：关键词检索不理解同义词和语义；资料按空行切分；检索证据只进入
+当前模型请求，不写入会话消息，也不形成长期 Memory。
 
 ### 阶段 7：Memory
 
@@ -591,13 +600,14 @@ AI 不自动 commit 或 push。每次提交前先展示变更摘要，由用户�
 - 当前恢复的是已保存的消息历史，不是任意中断点的自动重放；
 - CLI 默认仍保持内存运行；只有同时传入 `--db` 和 `--session-id` 才使用 SQLite；
 - 每个会话的工具调用 ID 根据已有持久化记录递增，避免跨进程继续会话时发生主键冲突。
-- 当前压缩只改变模型请求窗口，不删除 SQLite 原始消息；摘要由本地规则生成，不产生额外 API 调用。
+- 当前压缩只改变模型请求窗口，不删除 SQLite 原始消息；DeepSeek 模式下摘要会产生额外模型调用。
+- 当前最小 RAG 使用本地关键词检索，不使用 embedding、向量数据库或 rerank。
 
 下一阶段：
 
-- 最小 RAG；
-- 文档切分、关键词召回和来源引用；
-- 将检索证据注入上下文，但不把 RAG 混同为 Memory。
+- Memory；
+- 区分用户长期偏好、会话历史与外部 RAG 资料；
+- 实现最小写入、搜索和召回策略。
 
 ## 8. 每阶段验收总标准
 

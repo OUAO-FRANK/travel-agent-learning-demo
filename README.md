@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-当前实现确定性的单工具 Agent Loop，并已加入第一版上下文窗口：
+当前实现确定性的单工具 Agent Loop，并已加入上下文窗口和最小 RAG：
 
 ```text
 CLI 输入
@@ -19,12 +19,15 @@ CLI 输入
 模型本轮真正收到的请求；Agent 内部的完整历史与这个请求窗口是两个不同概念。
 当前用消息数量做教学版预算，工具调用请求和工具结果会作为一轮整体保留。
 
+现在还可以给 Agent 接入本地旅行资料。使用 `--knowledge-base` 后，Agent 会先按
+关键词检索资料片段，再把带来源的证据作为临时上下文交给模型。检索证据不会写入
+SQLite 的 `messages`，也不等同于用户的长期 Memory。
+
 现在还支持一个可观察的上下文压缩实验。使用 `--max-messages 4 --compress-context` 时，
-超出预算的较早完整轮次会被整理成一条本地摘要消息，
-最近轮次保持原文；摘要保留用户需求和工具结果，省略旧助手回答。SQLite 中的原始
+超出预算的较早完整轮次会被整理成一条摘要消息。Fake 模式使用本地提取规则，
+DeepSeek 模式会额外调用一次 LLM 生成摘要；最近轮次保持原文。SQLite 中的原始
 `messages` 不会被删除或改写。压缩摘要正文会作为 `context_compressed` 事件证据保存在
-`events` 表，但不会被当作新的对话消息写入 `messages` 表。当前摘要不调用
-真实模型，保证实验确定且不产生额外 API 成本。
+`events` 表，但不会被当作新的对话消息写入 `messages` 表。
 
 阶段 5 增加了可选的 `SQLiteSessionStore`。传入 `session_store` 和 `session_id`
 后，Agent 会保存 `sessions`、`messages`、`events` 和 `tool_calls`，重新创建
@@ -157,6 +160,20 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m app `
 assistant 是运行时生成的历史摘要。数据库仍会显示 `persisted_message_count=6`，说明压缩
 只改变本次请求窗口，没有抹掉原始对话；摘要正文可在 `events` 事件证据中查看。
 
+要运行最小 RAG：
+
+```powershell
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider deepseek `
+  --knowledge-base .\data\travel_notes.md `
+  --rag-top-k 2 `
+  "我想安排上海外滩夜景和历史景点"
+```
+
+输出中重点观察 `rag_search_started`、`rag_search_completed`，以及
+`model_request` 的 `retrieved_sources`。模型会看到类似 `[travel_notes.md:0]` 的来源标记；
+没有命中时，系统会明确告诉模型资料库没有直接证据。
+
 如果你要显式使用旧名称 `deepseek-v4-flash`，只需改为：
 
 ```powershell
@@ -186,5 +203,6 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m unittest discover -v
 - Agent 是否通过注入的注册表执行自定义工具。
 - 上下文窗口是否保留 system prompt、完整工具回合，并正确记录被截断的历史。
 - 上下文压缩是否只替换请求窗口中的旧轮次、保留最近轮次和数据库原文。
+- RAG 是否只召回匹配片段、保留来源，并把证据作为临时上下文注入模型请求。
 - SQLite 重新打开后是否能恢复消息、事件和工具调用证据。
 - CLI 是否能在重复使用同一数据库和 session ID 时恢复历史并显示持久化统计。

@@ -100,6 +100,33 @@ class CliTests(unittest.TestCase):
             self.assertIn("'compressed_messages': 4", printed)
             self.assertIn("'max_messages': 4", printed)
 
+    def test_main_can_enable_rag_from_a_knowledge_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            knowledge_base = Path(directory) / "travel-notes.md"
+            knowledge_base.write_text(
+                "上海外滩适合夜景，建议晚上前往。\n\n杭州西湖适合散步。",
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                exit_code = main(
+                    [
+                        "--knowledge-base",
+                        str(knowledge_base),
+                        "--rag-top-k",
+                        "1",
+                        "上海夜景怎么安排",
+                    ]
+                )
+
+            printed = output.getvalue()
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("event=rag_search_started", printed)
+            self.assertIn("event=rag_search_completed", printed)
+            self.assertIn("travel-notes.md:0", printed)
+
     def test_main_restores_history_when_reusing_session_id(self):
         """第二次 CLI 运行应从数据库恢复第一次运行的消息。"""
 
