@@ -1,7 +1,7 @@
 import unittest
 
 from app.agent import TravelAgent
-from app.domain import Message, ToolCall
+from app.domain import Message, ToolCall, ToolCallBatch
 from app.model import ModelProviderError, OpenAICompatibleModel
 
 
@@ -114,6 +114,49 @@ class OpenAICompatibleModelTests(unittest.TestCase):
                     "city": "上海",
                 },
                 reasoning_content="先查询上海天气。",
+            ),
+        )
+
+    def test_complete_parses_multiple_tool_calls_as_a_batch(self):
+        def transport(endpoint, headers, payload):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "上海"}',
+                                    }
+                                },
+                                {
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "北京"}',
+                                    }
+                                },
+                            ],
+                        }
+                    }
+                ]
+            }
+
+        provider = OpenAICompatibleModel(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            model="demo-model",
+            transport=transport,
+        )
+
+        self.assertEqual(
+            provider.complete([Message(role="user", content="查两个城市")], tools=[]),
+            ToolCallBatch(
+                calls=(
+                    ToolCall(name="get_weather", arguments={"city": "上海"}),
+                    ToolCall(name="get_weather", arguments={"city": "北京"}),
+                )
             ),
         )
 

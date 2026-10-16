@@ -39,6 +39,19 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class ToolCallBatch:
+    """模型在一次响应中提出的多个独立工具调用。"""
+
+    # 使用 tuple 固定调用顺序；队列阶段会按这个顺序执行。
+    calls: tuple[ToolCall, ...]
+
+    def __post_init__(self) -> None:
+        # 空批次没有任何可执行工作，通常说明 Provider 解析出了异常响应。
+        if not self.calls:
+            raise ValueError("tool call batch must not be empty")
+
+
+@dataclass(frozen=True)
 class Message:
     """一条发给模型的消息。
 
@@ -62,6 +75,16 @@ class Message:
     # tool_call 只有 assistant 请求工具时才有值；普通文本消息为 None。
     # 使用可选字段让旧的 system/user 文本消息继续保持简单。
     tool_call: ToolCall | None = None
+
+    # 新版模型可能在一条 assistant 消息中请求多个工具。
+    # 保留 tool_call 字段是为了兼容前面课程已经实现的单工具消息。
+    tool_calls: tuple[ToolCall, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.tool_call is not None and self.tool_calls is not None:
+            raise ValueError("message cannot contain tool_call and tool_calls together")
+        if self.tool_calls is not None and not self.tool_calls:
+            raise ValueError("message tool_calls must not be empty")
 
 
 @dataclass(frozen=True)

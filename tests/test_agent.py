@@ -2,10 +2,11 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from app.domain import AgentEvent, Message, ToolCall
+from app.domain import AgentEvent, Message, ToolCall, ToolCallBatch
 from app.agent import TravelAgent
 from app.context import ContextBuilder
 from app.model import FakeModel
+from app.memory import SQLiteMemoryStore
 from app.rag import KeywordRetriever
 from app.summarizer import LLMConversationSummarizer
 from app.tools import ToolDefinition, ToolRegistry
@@ -63,6 +64,76 @@ class FakeModelTests(unittest.TestCase):
 
 
 class TravelAgentTests(unittest.TestCase):
+    def test_run_executes_a_tool_batch_in_order_before_next_model_request(self):
+        model = FakeModel(
+            [
+                ToolCallBatch(
+                    calls=(
+                        ToolCall(name="get_weather", arguments={"city": "上海"}),
+                        ToolCall(name="get_weather", arguments={"city": "北京"}),
+                    )
+                ),
+                "上海晴朗，北京多云。",
+            ]
+        )
+
+        result = TravelAgent(model).run("同时查上海和北京天气")
+
+        self.assertEqual(result.answer, "上海晴朗，北京多云。")
+        self.assertEqual(
+            [event.kind for event in result.events],
+            [
+                "user_input",
+                "model_request",
+                "tool_queue_started",
+                "tool_requested",
+                "tool_result",
+                "tool_requested",
+                "tool_result",
+                "tool_queue_finished",
+                "model_request",
+                "model_response",
+                "run_finished",
+            ],
+        )
+        self.assertEqual(
+            [message.content for message in model.requests[1][-2:]],
+            ["上海：晴，25°C", "北京：多云，20°C"],
+        )
+        self.assertEqual(
+            len(model.requests[1][-3].tool_calls or ()),
+            2,
+        )
+    def test_run_writes_explicit_memory_and_recalls_it_for_later_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory_store = SQLiteMemoryStore(Path(directory) / "travel-agent.db")
+            first_model = FakeModel(["好的，我记住了。"])
+            first_agent = TravelAgent(
+                first_model,
+                memory_store=memory_store,
+                memory_user_id="alice",
+            )
+
+            first_result = first_agent.run("请记住我喜欢历史景点")
+
+            second_model = FakeModel(["我会优先安排历史景点。"])
+            second_agent = TravelAgent(
+                second_model,
+                memory_store=memory_store,
+                memory_user_id="alice",
+            )
+            result = second_agent.run("帮我规划上海历史路线")
+
+            self.assertIn("memory_written", [event.kind for event in first_result.events])
+            self.assertIn("memory_search_completed", [event.kind for event in result.events])
+            self.assertTrue(
+                any(
+                    message.role == "assistant"
+                    and "[memory:1] 我喜欢历史景点" in message.content
+                    for message in second_model.requests[0]
+                )
+            )
+
     def test_run_retrieves_evidence_and_injects_it_into_model_context(self):
         model = FakeModel(["根据资料，上海外滩适合安排在晚上。"])
         retriever = KeywordRetriever.from_text(

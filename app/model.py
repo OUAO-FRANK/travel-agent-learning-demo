@@ -22,11 +22,11 @@ from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from app.domain import Message, ToolCall
+from app.domain import Message, ToolCall, ToolCallBatch
 
 
-ModelOutput = str | ToolCall
-"""模型一次请求允许返回的两种结果：最终文本或结构化工具调用。"""
+ModelOutput = str | ToolCall | ToolCallBatch
+"""模型一次请求可以返回文本、单个工具调用或多个调用组成的批次。"""
 
 
 class ModelProviderError(RuntimeError):
@@ -129,43 +129,57 @@ class OpenAICompatibleModel:
 
         result: list[dict[str, object]] = []
         next_tool_call_id = 0
-        pending_tool_call_id: str | None = None
+        pending_tool_call_ids: list[str] = []
 
         for message in messages:
+            requested_tool_calls = []
             if message.tool_call is not None:
-                tool_call_id = f"call-{next_tool_call_id}"
-                next_tool_call_id += 1
-                pending_tool_call_id = tool_call_id
+                requested_tool_calls = [message.tool_call]
+            elif message.tool_calls is not None:
+                requested_tool_calls = list(message.tool_calls)
+
+            if requested_tool_calls:
+                serialized_tool_calls = []
+                for requested_tool_call in requested_tool_calls:
+                    tool_call_id = f"call-{next_tool_call_id}"
+                    next_tool_call_id += 1
+                    pending_tool_call_ids.append(tool_call_id)
+                    serialized_tool_calls.append(
+                        {
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": requested_tool_call.name,
+                                "arguments": json.dumps(
+                                    requested_tool_call.arguments,
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    )
                 result.append(
                     {
                         "role": "assistant",
                         "content": None,
-                        "tool_calls": [
-                            {
-                                "id": tool_call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": message.tool_call.name,
-                                    "arguments": json.dumps(
-                                        message.tool_call.arguments,
-                                        ensure_ascii=False,
-                                    ),
-                                },
-                            }
-                        ],
+                        "tool_calls": serialized_tool_calls,
                     }
                 )
-                if message.tool_call.reasoning_content is not None:
-                    result[-1]["reasoning_content"] = message.tool_call.reasoning_content
+                reasoning_content = requested_tool_calls[0].reasoning_content
+                if reasoning_content is not None:
+                    result[-1]["reasoning_content"] = reasoning_content
             elif message.role == "tool":
+                tool_call_id = (
+                    pending_tool_call_ids.pop(0)
+                    if pending_tool_call_ids
+                    else "call-0"
+                )
                 result.append(
                     {
                         "role": "tool",
                         "content": message.content,
-                        "tool_call_id": pending_tool_call_id or "call-0",
+                        "tool_call_id": tool_call_id,
                     }
                 )
-                pending_tool_call_id = None
             else:
                 result.append(
                     {
@@ -244,11 +258,48 @@ class OpenAICompatibleModel:
             if reasoning_content is not None and not isinstance(reasoning_content, str):
                 raise ModelProviderError("provider reasoning_content must be text")
 
-            return ToolCall(
-                name=name,
-                arguments=arguments,
-                reasoning_content=reasoning_content,
-            )
+            parsed_calls = [
+                ToolCall(
+                    name=name,
+                    arguments=arguments,
+                    reasoning_content=reasoning_content,
+                )
+            ]
+            for additional_tool_call in tool_calls[1:]:
+                if not isinstance(additional_tool_call, dict):
+                    raise ModelProviderError("provider tool call must be an object")
+                additional_function = additional_tool_call.get("function")
+                if not isinstance(additional_function, dict):
+                    raise ModelProviderError("provider tool call missing function")
+                additional_name = additional_function.get("name")
+                additional_arguments_text = additional_function.get("arguments")
+                if (
+                    not isinstance(additional_name, str)
+                    or not isinstance(additional_arguments_text, str)
+                ):
+                    raise ModelProviderError(
+                        "provider function requires name and arguments"
+                    )
+                try:
+                    additional_arguments = json.loads(additional_arguments_text)
+                except json.JSONDecodeError as exc:
+                    raise ModelProviderError(
+                        "provider tool arguments are not JSON"
+                    ) from exc
+                if not isinstance(additional_arguments, dict):
+                    raise ModelProviderError(
+                        "provider tool arguments must be an object"
+                    )
+                parsed_calls.append(
+                    ToolCall(
+                        name=additional_name,
+                        arguments=additional_arguments,
+                    )
+                )
+
+            if len(parsed_calls) == 1:
+                return parsed_calls[0]
+            return ToolCallBatch(calls=tuple(parsed_calls))
 
         content = message.get("content")
         if isinstance(content, str):

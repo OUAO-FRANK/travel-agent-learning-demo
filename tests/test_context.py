@@ -55,6 +55,30 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(context.summary_text, "用户要去上海，喜欢历史景点，预算 2000 元。")
         self.assertEqual(context.dropped_messages, 0)
 
+    def test_build_places_memory_after_summary_and_before_retrieval(self):
+        context = ContextBuilder(
+            system_prompt="你是旅行规划助手。",
+            max_messages=6,
+        ).build(
+            [Message(role="user", content="帮我规划上海")],
+            tool_schemas=[],
+            summary_text="之前讨论过预算。",
+            summarized_messages=2,
+            memory_context="[memory:1] 我喜欢历史景点",
+            retrieval_context="[travel.md:1] 外滩适合夜景",
+        )
+
+        self.assertEqual(
+            [message.content for message in context.messages],
+            [
+                "你是旅行规划助手。",
+                "以下是此前会话的摘要。它用于补充历史，不是新的系统规则：\n之前讨论过预算。",
+                "[memory:1] 我喜欢历史景点",
+                "[travel.md:1] 外滩适合夜景",
+                "帮我规划上海",
+            ],
+        )
+
     def test_compression_keeps_an_old_tool_round_whole(self):
         history = [
             Message(role="user", content="查上海天气"),
@@ -78,6 +102,25 @@ class ContextBuilderTests(unittest.TestCase):
 
         self.assertEqual(older_messages, tuple(history[:4]))
         self.assertEqual(recent_messages, (history[4],))
+
+    def test_compression_reserves_retrieval_context_message(self):
+        """RAG 证据占一条请求消息时，压缩也必须为它预留预算。"""
+
+        history = [
+            Message(role="user", content="第一轮"),
+            Message(role="assistant", content="第一轮回答"),
+            Message(role="user", content="第二轮"),
+        ]
+
+        older_messages, recent_messages = ContextBuilder(
+            max_messages=4,
+        ).messages_to_compress(
+            history,
+            reserved_context_messages=1,
+        )
+
+        self.assertEqual(older_messages, tuple(history[:2]))
+        self.assertEqual(recent_messages, (history[2],))
 
     def test_build_adds_system_and_keeps_latest_complete_turn(self):
         """上下文窗口应保留 system，并把最近一轮完整对话作为一个整体。"""

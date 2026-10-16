@@ -4,7 +4,8 @@
 
 ## 当前阶段
 
-当前实现确定性的单工具 Agent Loop，并已加入上下文窗口和最小 RAG：
+当前实现确定性的 Agent Loop，并已加入上下文窗口、最小 RAG、最小 Memory
+和串行多工具队列：
 
 ```text
 CLI 输入
@@ -15,6 +16,11 @@ CLI 输入
   -> 事件轨迹和最终答案
 ```
 
+FakeModel 还可以用 `--demo-tool-batch` 一次返回两个天气工具调用，观察
+`tool_queue_started`、两个 `tool_requested/tool_result` 对和
+`tool_queue_finished`。当前队列是串行、fail-fast 的；并发、依赖关系、取消和重试
+留到后续 Harness 课程。
+
 `ContextBuilder` 会把 system prompt、最近的完整对话轮次和工具目录组装成
 模型本轮真正收到的请求；Agent 内部的完整历史与这个请求窗口是两个不同概念。
 当前用消息数量做教学版预算，工具调用请求和工具结果会作为一轮整体保留。
@@ -22,6 +28,11 @@ CLI 输入
 现在还可以给 Agent 接入本地旅行资料。使用 `--knowledge-base` 后，Agent 会先按
 关键词检索资料片段，再把带来源的证据作为临时上下文交给模型。检索证据不会写入
 SQLite 的 `messages`，也不等同于用户的长期 Memory。
+
+现在还支持最小长期 Memory。使用 `--memory-db` 和 `--memory-user` 后，明确以
+“请记住……”开头的输入会写入独立的 `memories` 表；后续同一用户的请求会按关键词
+召回相关记忆，并把它作为临时上下文交给模型。普通的“我喜欢历史景点”不会自动写入，
+这样可以先看清显式写入、用户隔离和召回的基本机制。
 
 现在还支持一个可观察的上下文压缩实验。使用 `--max-messages 4 --compress-context` 时，
 超出预算的较早完整轮次会被整理成一条摘要消息。Fake 模式使用本地提取规则，
@@ -173,6 +184,42 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m app `
 输出中重点观察 `rag_search_started`、`rag_search_completed`，以及
 `model_request` 的 `retrieved_sources`。模型会看到类似 `[travel_notes.md:0]` 的来源标记；
 没有命中时，系统会明确告诉模型资料库没有直接证据。
+
+要观察 Memory，可以先使用 FakeModel 做两次运行。两次命令必须使用同一个
+`--memory-db` 和 `--memory-user`：
+
+```powershell
+$memoryDb = Join-Path $env:LOCALAPPDATA "TravelAgentLab\memories-demo.db"
+
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider fake `
+  --memory-db $memoryDb `
+  --memory-user alice `
+  "请记住我喜欢历史景点"
+
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider fake `
+  --memory-db $memoryDb `
+  --memory-user alice `
+  "帮我规划上海历史路线"
+```
+
+第一次重点观察 `memory_written`；第二次重点观察 `memory_search_completed`、
+`memory_ids` 和 `model_request` 中的 `recalled_memory_ids`。如果把用户改成 `bob`，
+第二次不会看到 `alice` 的记忆。FakeModel 的答案固定不变，但请求轨迹会证明记忆是否
+进入了模型上下文；换成 `--provider deepseek` 才能观察真实模型如何利用它。
+
+要直接观察串行多工具队列：
+
+```powershell
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider fake `
+  --demo-tool-batch `
+  "同时查上海和北京天气"
+```
+
+第二次 `model_request` 会包含一条 assistant 批量工具请求和两个 tool observation；
+事件中的 `call-1-1`、`call-1-2` 表示队列按顺序执行了两个任务。
 
 如果你要显式使用旧名称 `deepseek-v4-flash`，只需改为：
 

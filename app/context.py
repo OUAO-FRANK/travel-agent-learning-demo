@@ -78,6 +78,7 @@ class ContextBuilder:
         tool_schemas: list[dict[str, object]],
         summary_text: str | None = None,
         summarized_messages: int = 0,
+        memory_context: str | None = None,
         retrieval_context: str | None = None,
     ) -> ModelContext:
         """生成包含 system、筛选后的历史和工具目录的请求快照。
@@ -92,11 +93,14 @@ class ContextBuilder:
 
         # 有摘要时仍从完整历史计算最近轮次，确保摘要只替代较早轮次，
         # 不会把最近的工具调用链重复放进摘要和原文两个位置。
-        # 摘要占用一条消息，所以带摘要时要比普通窗口多预留一个位置。
+        # 摘要、Memory 和 RAG 证据各占一条临时上下文消息，所以都要
+        # 从历史预算中预留位置。
         selected_history = self._select_history(
             history,
             reserved_context_messages=(
-                int(summary_text is not None) + int(retrieval_context is not None)
+                int(summary_text is not None)
+                + int(memory_context is not None)
+                + int(retrieval_context is not None)
             ),
         )
         system_message = Message(role="system", content=self.system_prompt)
@@ -122,6 +126,12 @@ class ContextBuilder:
                 Message(role="assistant", content=retrieval_context),
             )
 
+        memory_messages: tuple[Message, ...] = ()
+        if memory_context is not None:
+            memory_messages = (
+                Message(role="assistant", content=memory_context),
+            )
+
         # deepcopy 不只复制最外层工具字典，也复制嵌套的 parameters 等对象，
         # 这样注册表或调用方后续修改 schema 不会污染已记录的请求快照。
         copied_tools = tuple(deepcopy(tool_schema) for tool_schema in tool_schemas)
@@ -130,6 +140,7 @@ class ContextBuilder:
             messages=(
                 system_message,
                 *summary_messages,
+                *memory_messages,
                 *retrieval_messages,
                 *selected_history,
             ),
@@ -164,8 +175,10 @@ class ContextBuilder:
         if self.max_messages is None or self.max_messages < 3:
             return (), tuple(history)
 
-        # 没有超过 system + 历史消息的预算时，不必生成摘要。
-        if len(history) + 1 <= self.max_messages:
+        # 这里必须把临时上下文也算进去。比如 RAG 证据会额外占一条
+        # assistant 消息；如果只计算 system + history，后续 build() 仍可能
+        # 组装出超过预算的请求，压缩就失去了作用。
+        if len(history) + 1 + reserved_context_messages <= self.max_messages:
             return (), tuple(history)
 
         turns = self._group_turns(history)
@@ -225,7 +238,7 @@ class ContextBuilder:
         if self.max_messages is None:
             return turns
 
-        # system prompt 占一条；摘要和 RAG 证据各占一条临时上下文消息。
+        # system prompt 占一条；摘要、Memory 和 RAG 证据各占一条临时上下文消息。
         history_budget = self.max_messages - 1 - reserved_context_messages
         selected_turns_reversed: list[tuple[Message, ...]] = []
         selected_count = 0

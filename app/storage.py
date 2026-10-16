@@ -90,11 +90,19 @@ class SQLiteSessionStore:
         # 1. asdict(...) 把 dataclass 转成普通 dict；
         # 2. json.dumps(...) 把 dict 转成 JSON 字符串。
         # 如果 message.tool_call 是 None，就存 NULL。
-        tool_call_json = (
-            json.dumps(asdict(message.tool_call), ensure_ascii=False)
-            if message.tool_call is not None
-            else None
-        )
+        if message.tool_calls is not None:
+            # 批量调用使用一个带 calls 字段的 JSON 包装，兼容旧数据库中
+            # 直接保存单个 ToolCall 字典的格式。
+            tool_call_json = json.dumps(
+                {"calls": [asdict(call) for call in message.tool_calls]},
+                ensure_ascii=False,
+            )
+        else:
+            tool_call_json = (
+                json.dumps(asdict(message.tool_call), ensure_ascii=False)
+                if message.tool_call is not None
+                else None
+            )
 
         with self._connect() as connection:
             # 计算本会话 messages 表里的下一个序号。
@@ -140,16 +148,7 @@ class SQLiteSessionStore:
         # row[2] 是 tool_call_json：
         # - 如果不是 NULL，用 _tool_call_from_json 反序列化成 ToolCall；
         # - 如果是 NULL，就保持 None。
-        return [
-            Message(
-                role=row[0],
-                content=row[1],
-                tool_call=(
-                    _tool_call_from_json(row[2]) if row[2] is not None else None
-                ),
-            )
-            for row in rows
-        ]
+        return [_message_from_row(row) for row in rows]
 
     def append_event(self, session_id: str, event: AgentEvent) -> None:
         """保存事件，并同步维护工具调用证据表。"""
@@ -438,6 +437,34 @@ def _tool_call_from_json(raw_json: str) -> ToolCall:
         name=payload["name"],
         arguments=payload["arguments"],
         reasoning_content=payload.get("reasoning_content"),
+    )
+
+
+def _message_from_row(row: tuple[object, ...]) -> Message:
+    """兼容恢复单工具和批量工具 assistant 消息。"""
+
+    raw_json = row[2]
+    if raw_json is None:
+        return Message(role=str(row[0]), content=str(row[1]))
+
+    payload = json.loads(str(raw_json))
+    if "calls" in payload:
+        return Message(
+            role=str(row[0]),
+            content=str(row[1]),
+            tool_calls=tuple(
+                ToolCall(
+                    name=call["name"],
+                    arguments=call["arguments"],
+                    reasoning_content=call.get("reasoning_content"),
+                )
+                for call in payload["calls"]
+            ),
+        )
+    return Message(
+        role=str(row[0]),
+        content=str(row[1]),
+        tool_call=_tool_call_from_json(str(raw_json)),
     )
 
 

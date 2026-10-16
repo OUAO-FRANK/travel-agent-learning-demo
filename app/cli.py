@@ -16,7 +16,9 @@ import sys
 from app.agent import TravelAgent
 from app.config import ConfigurationError, load_model_config
 from app.context import ContextBuilder
+from app.domain import ToolCall, ToolCallBatch
 from app.model import FakeModel, ModelProviderError, OpenAICompatibleModel
+from app.memory import SQLiteMemoryStore
 from app.rag import KeywordRetriever
 from app.storage import SQLiteSessionStore
 from app.summarizer import ExtractiveSummarizer, LLMConversationSummarizer
@@ -70,6 +72,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="RAG 最多注入多少个资料片段，默认 3",
     )
+    parser.add_argument(
+        "--memory-db",
+        type=Path,
+        help="长期记忆 SQLite 文件；必须和 --memory-user 一起使用",
+    )
+    parser.add_argument(
+        "--memory-user",
+        help="长期记忆所属用户 ID；必须和 --memory-db 一起使用",
+    )
+    parser.add_argument(
+        "--demo-tool-batch",
+        action="store_true",
+        help="FakeModel 使用两个天气调用演示串行工具队列",
+    )
     return parser
 
 
@@ -98,6 +114,8 @@ def main(
     # 这样用户不会误以为消息已经保存，却实际上没有稳定的会话键。
     if (args.db is None) != (args.session_id is None):
         parser.error("--db and --session-id must be provided together")
+    if (args.memory_db is None) != (args.memory_user is None):
+        parser.error("--memory-db and --memory-user must be provided together")
 
     try:
         context_builder = ContextBuilder(
@@ -122,6 +140,11 @@ def main(
     session_store = (
         SQLiteSessionStore(args.db)
         if args.db is not None and args.session_id is not None
+        else None
+    )
+    memory_store = (
+        SQLiteMemoryStore(args.memory_db)
+        if args.memory_db is not None and args.memory_user is not None
         else None
     )
 
@@ -158,7 +181,26 @@ def main(
 
     if config.provider == "fake":
         # FakeModel 让 CLI 不需要 API Key 或网络，也保证演示结果可重复。
-        model = FakeModel(["这是一个确定性的旅行规划示例。"])
+        if args.demo_tool_batch:
+            model = FakeModel(
+                [
+                    ToolCallBatch(
+                        calls=(
+                            ToolCall(
+                                name="get_weather",
+                                arguments={"city": "上海"},
+                            ),
+                            ToolCall(
+                                name="get_weather",
+                                arguments={"city": "北京"},
+                            ),
+                        )
+                    ),
+                    "上海晴朗，北京多云。",
+                ]
+            )
+        else:
+            model = FakeModel(["这是一个确定性的旅行规划示例。"])
     else:
         # API key 已由配置层从环境变量读取；这里不把它打印到终端。
         model = OpenAICompatibleModel(
@@ -182,6 +224,8 @@ def main(
         summarizer=summarizer,
         retriever=retriever,
         rag_top_k=args.rag_top_k,
+        memory_store=memory_store,
+        memory_user_id=args.memory_user,
     )
     try:
         result = agent.run(args.user_text, session_id=args.session_id)
@@ -198,6 +242,16 @@ def main(
 
     # 最终答案单独输出，方便用户区分“过程证据”和“最终结果”。
     print(f"answer={result.answer}")
+
+    if memory_store is not None and args.memory_user is not None:
+        persisted_memories = memory_store.list(args.memory_user)
+        print(f"memory_db={memory_store.database_path}")
+        print(f"memory_user={args.memory_user}")
+        print(f"memory_count={len(persisted_memories)}")
+        print(
+            "memory_contents="
+            f"{[item.content for item in persisted_memories]!r}"
+        )
 
     # 运行结束后重新从数据库读取，而不是直接用 Agent 内存中的列表。
     # 这样输出验证的是“已经写入磁盘并能被 Store 重新读出”的结果。

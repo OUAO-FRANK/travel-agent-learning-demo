@@ -127,6 +127,45 @@ class CliTests(unittest.TestCase):
             self.assertIn("event=rag_search_completed", printed)
             self.assertIn("travel-notes.md:0", printed)
 
+    def test_main_can_write_and_recall_explicit_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory_db = Path(directory) / "memories.db"
+            first_output = io.StringIO()
+            second_output = io.StringIO()
+            common = ["--memory-db", str(memory_db), "--memory-user", "alice"]
+
+            with redirect_stdout(first_output):
+                first_exit_code = main([*common, "请记住我喜欢历史景点"])
+            with redirect_stdout(second_output):
+                second_exit_code = main([*common, "帮我规划上海历史路线"])
+
+            self.assertEqual((first_exit_code, second_exit_code), (0, 0))
+            self.assertIn("event=memory_written", first_output.getvalue())
+            self.assertIn("event=memory_search_completed", second_output.getvalue())
+            self.assertIn("memory_ids': [1]", second_output.getvalue())
+
+    def test_main_can_run_the_deterministic_multi_tool_demo(self):
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--provider",
+                    "fake",
+                    "--demo-tool-batch",
+                    "同时查上海和北京天气",
+                ]
+            )
+
+        printed = output.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("event=tool_queue_started", printed)
+        self.assertIn("'count': 2", printed)
+        self.assertIn("event=tool_queue_finished", printed)
+        self.assertIn("call-1-1", printed)
+        self.assertIn("call-1-2", printed)
+
     def test_main_restores_history_when_reusing_session_id(self):
         """第二次 CLI 运行应从数据库恢复第一次运行的消息。"""
 

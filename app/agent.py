@@ -16,12 +16,18 @@
 from dataclasses import dataclass
 
 from app.context import ContextBuilder
-from app.domain import AgentEvent, Message, ToolCall
+from app.domain import AgentEvent, Message, ToolCall, ToolCallBatch
 from app.model import ModelProvider
+from app.memory import (
+    SQLiteMemoryStore,
+    extract_explicit_memory,
+    format_memory_context,
+)
 from app.rag import KeywordRetriever, format_retrieval_context
 from app.storage import SQLiteSessionStore
 from app.summarizer import ConversationSummarizer, ExtractiveSummarizer
 from app.tools import ToolRegistry, build_default_registry
+from app.tool_queue import ToolQueue
 
 
 @dataclass(frozen=True)
@@ -69,6 +75,8 @@ class TravelAgent:
         summarizer: ConversationSummarizer | None = None,
         retriever: KeywordRetriever | None = None,
         rag_top_k: int = 3,
+        memory_store: SQLiteMemoryStore | None = None,
+        memory_user_id: str | None = None,
     ) -> None:
         # 保存模型依赖，但不复制或修改模型对象。
         # Agent 负责流程，具体的 ModelProvider 实现负责产生模型回复。
@@ -105,6 +113,14 @@ class TravelAgent:
             raise ValueError("rag_top_k must be greater than 0")
         self.retriever = retriever
         self.rag_top_k = rag_top_k
+        self.tool_queue = ToolQueue()
+
+        # Memory 必须同时知道“存到哪里”和“属于哪个用户”。如果只传其中
+        # 一个，记忆可能丢失或错误地串到别的用户，因此启动时直接拒绝。
+        if (memory_store is None) != (memory_user_id is None):
+            raise ValueError("memory_store and memory_user_id must be provided together")
+        self.memory_store = memory_store
+        self.memory_user_id = memory_user_id
 
     def run(
         self,
@@ -166,8 +182,60 @@ class TravelAgent:
         # 增加消息数量，所以第二次模型请求前可能需要扩大摘要覆盖范围。
         summary_text: str | None = None
         summarized_messages = 0
+        memory_context: str | None = None
+        recalled_memory_ids: tuple[int, ...] = ()
         retrieval_context: str | None = None
         retrieved_sources: tuple[str, ...] = ()
+
+        if self.memory_store is not None and self.memory_user_id is not None:
+            explicit_memory = extract_explicit_memory(user_text)
+            if explicit_memory is not None:
+                memory_item = self.memory_store.add(
+                    self.memory_user_id,
+                    explicit_memory,
+                    source="explicit",
+                )
+                self._record_event(
+                    events,
+                    AgentEvent(
+                        kind="memory_written",
+                        payload={
+                            "memory_id": memory_item.id,
+                            "user_id": self.memory_user_id,
+                            "content": memory_item.content,
+                            "source": memory_item.source,
+                        },
+                    ),
+                    session_id,
+                )
+
+            self._record_event(
+                events,
+                AgentEvent(
+                    kind="memory_search_started",
+                    payload={"user_id": self.memory_user_id, "query": user_text},
+                ),
+                session_id,
+            )
+            memory_results = self.memory_store.search(
+                self.memory_user_id,
+                user_text,
+            )
+            memory_context = format_memory_context(memory_results)
+            recalled_memory_ids = tuple(item.id for item in memory_results)
+            self._record_event(
+                events,
+                AgentEvent(
+                    kind="memory_search_completed",
+                    payload={
+                        "user_id": self.memory_user_id,
+                        "query": user_text,
+                        "result_count": len(memory_results),
+                        "memory_ids": list(recalled_memory_ids),
+                    },
+                ),
+                session_id,
+            )
 
         if self.retriever is not None:
             self._record_event(
@@ -203,7 +271,10 @@ class TravelAgent:
             if self.context_builder.enable_compression:
                 older_messages, _ = self.context_builder.messages_to_compress(
                     messages,
-                    reserved_context_messages=int(retrieval_context is not None),
+                    reserved_context_messages=(
+                        int(memory_context is not None)
+                        + int(retrieval_context is not None)
+                    ),
                 )
                 # 只在摘要覆盖范围扩大时重新生成，避免同一轮重复记录压缩事件。
                 if len(older_messages) > summarized_messages:
@@ -258,6 +329,7 @@ class TravelAgent:
                 tool_schemas,
                 summary_text=summary_text,
                 summarized_messages=summarized_messages,
+                memory_context=memory_context,
                 retrieval_context=retrieval_context,
             )
 
@@ -274,6 +346,7 @@ class TravelAgent:
                         "tool_count": len(context.tools),
                         "dropped_messages": context.dropped_messages,
                         "summarized_messages": context.summarized_messages,
+                        "recalled_memory_ids": list(recalled_memory_ids),
                         "retrieved_sources": list(retrieved_sources),
                     },
                 ),
@@ -316,7 +389,7 @@ class TravelAgent:
                     events=tuple(events),
                 )
 
-            if not isinstance(model_output, ToolCall):
+            if not isinstance(model_output, (ToolCall, ToolCallBatch)):
                 # FakeModel 当前只允许 str 或 ToolCall；其他类型说明模型
                 # 适配器违反了契约，不能把它当作正常答案继续传播。
                 raise TypeError("model output must be text or ToolCall")
@@ -326,52 +399,91 @@ class TravelAgent:
                 raise RuntimeError("maximum tool rounds exceeded")
 
             tool_rounds += 1
-            call = model_output
+            calls = (
+                (model_output,)
+                if isinstance(model_output, ToolCall)
+                else model_output.calls
+            )
+            is_batch = len(calls) > 1
 
             # 把模型的动作也放进消息历史。下一轮模型需要知道自己刚才
             # 请求了什么工具，否则工具结果会失去上下文。
             assistant_message = Message(
                 role="assistant",
                 content="",
-                tool_call=call,
+                tool_call=calls[0] if len(calls) == 1 else None,
+                tool_calls=calls if len(calls) > 1 else None,
             )
             messages.append(assistant_message)
             self._record_message(assistant_message, session_id)
-            call_id = (
-                self.session_store.next_tool_call_id(session_id)
-                if self.session_store is not None and session_id is not None
-                else f"call-{tool_rounds}"
-            )
-            self._record_event(
-                events,
-                AgentEvent(
-                    kind="tool_requested",
-                    payload={
-                        "call_id": call_id,
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    },
-                ),
-                session_id,
-            )
+            if is_batch:
+                self._record_event(
+                    events,
+                    AgentEvent(
+                        kind="tool_queue_started",
+                        payload={"count": len(calls)},
+                    ),
+                    session_id,
+                )
 
-            # Runtime 执行工具，而不是让模型直接执行 Python 函数。
-            observation = self.registry.dispatch(call)
-            tool_message = Message(role="tool", content=observation)
-            messages.append(tool_message)
-            self._record_message(tool_message, session_id)
-            self._record_event(
-                events,
-                AgentEvent(
-                    kind="tool_result",
-                    payload={
-                        "call_id": call_id,
-                        "name": call.name,
-                        "content": observation,
-                    },
-                ),
-                session_id,
-            )
+            call_counter = 0
+
+            def execute_one(call: ToolCall) -> str:
+                """执行队列中的一个调用，并记录完整的可观察轨迹。"""
+
+                nonlocal call_counter
+                call_counter += 1
+                call_id = (
+                    self.session_store.next_tool_call_id(session_id)
+                    if self.session_store is not None and session_id is not None
+                    else (
+                        f"call-{tool_rounds}-{call_counter}"
+                        if is_batch
+                        else f"call-{tool_rounds}"
+                    )
+                )
+                self._record_event(
+                    events,
+                    AgentEvent(
+                        kind="tool_requested",
+                        payload={
+                            "call_id": call_id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        },
+                    ),
+                    session_id,
+                )
+
+                # Runtime 执行工具，而不是让模型直接执行 Python 函数。
+                observation = self.registry.dispatch(call)
+                tool_message = Message(role="tool", content=observation)
+                messages.append(tool_message)
+                self._record_message(tool_message, session_id)
+                self._record_event(
+                    events,
+                    AgentEvent(
+                        kind="tool_result",
+                        payload={
+                            "call_id": call_id,
+                            "name": call.name,
+                            "content": observation,
+                        },
+                    ),
+                    session_id,
+                )
+                return observation
+
+            self.tool_queue.execute(calls, execute_one)
+            if is_batch:
+                self._record_event(
+                    events,
+                    AgentEvent(
+                        kind="tool_queue_finished",
+                        payload={"count": len(calls)},
+                    ),
+                    session_id,
+                )
 
     def _record_event(
         self,

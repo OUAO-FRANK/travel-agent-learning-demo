@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.domain import AgentEvent, Message, ToolCall
+from app.domain import AgentEvent, Message, ToolCall, ToolCallBatch
 from app.storage import SQLiteSessionStore
 
 
@@ -113,6 +113,38 @@ class SQLiteSessionStoreTests(unittest.TestCase):
 
             self.assertTrue(
                 {"sessions", "messages", "events", "tool_calls"}.issubset(tables)
+            )
+
+    def test_batch_tool_calls_round_trip_after_reopening_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "travel-agent.db"
+            store = SQLiteSessionStore(database_path)
+            store.append_message(
+                "trip-1",
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=(
+                        ToolCall(name="get_weather", arguments={"city": "上海"}),
+                        ToolCall(name="get_weather", arguments={"city": "北京"}),
+                    ),
+                ),
+            )
+
+            restarted_store = SQLiteSessionStore(database_path)
+
+            self.assertEqual(
+                restarted_store.load_messages("trip-1"),
+                [
+                    Message(
+                        role="assistant",
+                        content="",
+                        tool_calls=(
+                            ToolCall(name="get_weather", arguments={"city": "上海"}),
+                            ToolCall(name="get_weather", arguments={"city": "北京"}),
+                        ),
+                    )
+                ],
             )
 
 
