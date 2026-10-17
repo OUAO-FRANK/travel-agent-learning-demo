@@ -434,8 +434,11 @@ SQLite / Agent 完整历史
 
 **实现增量**：
 
-- 最大模型轮数；
-- 最大工具调用数；
+- 第一课：`RuntimeHarness` 独立记录一次运行的模型请求数和工具调用数；
+- 第一课：`max_model_requests` 和 `max_tool_calls` 两种预算；
+- 第一课：预算在每次 `run()` 开始时重置；
+- 第一课：预算耗尽时记录 `harness_limit_reached`，返回 `status=stopped`；
+- 后续：最大模型轮数；
 - 超时；
 - 重试和退避；
 - 取消信号；
@@ -448,6 +451,9 @@ SQLite / Agent 完整历史
 **必须理解**：Harness 控制运行，Agent 做决策；不要把所有控制逻辑塞进 Agent 主循环。
 
 **验收证据**：故障注入、超时、中断恢复和预算耗尽各有测试。
+
+**当前实现边界**：本课只实现模型请求预算和工具调用预算；停止是可观察的正常结果，
+但还没有超时、重试、取消、checkpoint/replay、权限和成本计算。
 
 ### 阶段 10：Evaluation Harness
 

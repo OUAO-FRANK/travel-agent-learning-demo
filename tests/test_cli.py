@@ -166,6 +166,28 @@ class CliTests(unittest.TestCase):
         self.assertIn("call-1-1", printed)
         self.assertIn("call-1-2", printed)
 
+    def test_main_can_stop_when_model_request_budget_is_exhausted(self):
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--provider",
+                    "fake",
+                    "--demo-tool-batch",
+                    "--max-model-requests",
+                    "1",
+                    "同时查上海和北京天气",
+                ]
+            )
+
+        printed = output.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("event=harness_limit_reached", printed)
+        self.assertIn("status=stopped", printed)
+        self.assertIn("max_model_requests_exceeded", printed)
+
     def test_main_restores_history_when_reusing_session_id(self):
         """第二次 CLI 运行应从数据库恢复第一次运行的消息。"""
 

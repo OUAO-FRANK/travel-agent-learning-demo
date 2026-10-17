@@ -7,6 +7,7 @@ from app.agent import TravelAgent
 from app.context import ContextBuilder
 from app.model import FakeModel
 from app.memory import SQLiteMemoryStore
+from app.harness import RuntimeHarness
 from app.rag import KeywordRetriever
 from app.summarizer import LLMConversationSummarizer
 from app.tools import ToolDefinition, ToolRegistry
@@ -64,6 +65,67 @@ class FakeModelTests(unittest.TestCase):
 
 
 class TravelAgentTests(unittest.TestCase):
+    def test_harness_stops_before_a_second_model_request_when_budget_is_exhausted(self):
+        model = FakeModel(
+            [
+                ToolCall(name="get_weather", arguments={"city": "上海"}),
+                "不会被请求到的最终答案",
+            ]
+        )
+        agent = TravelAgent(
+            model,
+            harness=RuntimeHarness(max_model_requests=1),
+        )
+
+        result = agent.run("查上海天气")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertIn("max_model_requests_exceeded", result.answer)
+        self.assertEqual(
+            [event.kind for event in result.events],
+            [
+                "user_input",
+                "model_request",
+                "tool_requested",
+                "tool_result",
+                "harness_limit_reached",
+                "run_finished",
+            ],
+        )
+
+    def test_harness_stops_a_tool_batch_before_exceeding_tool_budget(self):
+        model = FakeModel(
+            [
+                ToolCallBatch(
+                    calls=(
+                        ToolCall(name="get_weather", arguments={"city": "上海"}),
+                        ToolCall(name="get_weather", arguments={"city": "北京"}),
+                    )
+                ),
+                "不会被请求到的最终答案",
+            ]
+        )
+        agent = TravelAgent(
+            model,
+            harness=RuntimeHarness(max_tool_calls=1),
+        )
+
+        result = agent.run("同时查上海和北京天气")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertIn("max_tool_calls_exceeded", result.answer)
+        self.assertEqual(
+            [event.kind for event in result.events],
+            [
+                "user_input",
+                "model_request",
+                "tool_queue_started",
+                "tool_requested",
+                "tool_result",
+                "harness_limit_reached",
+                "run_finished",
+            ],
+        )
     def test_run_executes_a_tool_batch_in_order_before_next_model_request(self):
         model = FakeModel(
             [

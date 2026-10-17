@@ -19,7 +19,11 @@ CLI 输入
 FakeModel 还可以用 `--demo-tool-batch` 一次返回两个天气工具调用，观察
 `tool_queue_started`、两个 `tool_requested/tool_result` 对和
 `tool_queue_finished`。当前队列是串行、fail-fast 的；并发、依赖关系、取消和重试
-留到后续 Harness 课程。
+仍留到后续课程。
+
+Runtime Harness 当前先提供运行预算：`--max-model-requests` 限制一次运行的模型请求数，
+`--max-tool-calls` 限制工具调用数。预算耗尽时 Agent 返回 `status=stopped`，并记录
+`harness_limit_reached`，不会继续调用模型或工具。
 
 `ContextBuilder` 会把 system prompt、最近的完整对话轮次和工具目录组装成
 模型本轮真正收到的请求；Agent 内部的完整历史与这个请求窗口是两个不同概念。
@@ -220,6 +224,19 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m app `
 
 第二次 `model_request` 会包含一条 assistant 批量工具请求和两个 tool observation；
 事件中的 `call-1-1`、`call-1-2` 表示队列按顺序执行了两个任务。
+
+要观察 Runtime Harness 截止模型请求：
+
+```powershell
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider fake `
+  --demo-tool-batch `
+  --max-model-requests 1 `
+  "同时查上海和北京天气"
+```
+
+第一次模型请求会返回工具批次并执行；工具结果回来后，第二次模型请求被 Harness
+拒绝。重点观察 `harness_limit_reached` 的 `reason` 和最后的 `status=stopped`。
 
 如果你要显式使用旧名称 `deepseek-v4-flash`，只需改为：
 

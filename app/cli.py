@@ -17,6 +17,7 @@ from app.agent import TravelAgent
 from app.config import ConfigurationError, load_model_config
 from app.context import ContextBuilder
 from app.domain import ToolCall, ToolCallBatch
+from app.harness import RuntimeHarness
 from app.model import FakeModel, ModelProviderError, OpenAICompatibleModel
 from app.memory import SQLiteMemoryStore
 from app.rag import KeywordRetriever
@@ -86,6 +87,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="FakeModel 使用两个天气调用演示串行工具队列",
     )
+    parser.add_argument(
+        "--max-model-requests",
+        type=int,
+        default=8,
+        help="本次运行最多允许的模型请求数，默认 8",
+    )
+    parser.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=8,
+        help="本次运行最多允许的工具调用数，默认 8",
+    )
     return parser
 
 
@@ -122,6 +135,14 @@ def main(
             system_prompt=TravelAgent.SYSTEM_PROMPT,
             max_messages=args.max_messages,
             enable_compression=args.compress_context,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    try:
+        harness = RuntimeHarness(
+            max_model_requests=args.max_model_requests,
+            max_tool_calls=args.max_tool_calls,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -226,6 +247,7 @@ def main(
         rag_top_k=args.rag_top_k,
         memory_store=memory_store,
         memory_user_id=args.memory_user,
+        harness=harness,
     )
     try:
         result = agent.run(args.user_text, session_id=args.session_id)
@@ -242,6 +264,7 @@ def main(
 
     # 最终答案单独输出，方便用户区分“过程证据”和“最终结果”。
     print(f"answer={result.answer}")
+    print(f"status={result.status}")
 
     if memory_store is not None and args.memory_user is not None:
         persisted_memories = memory_store.list(args.memory_user)
