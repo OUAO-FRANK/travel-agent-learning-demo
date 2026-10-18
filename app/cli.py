@@ -99,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="本次运行最多允许的工具调用数，默认 8",
     )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        help="本次运行的总截止时间（秒）；0 表示立即到期，不传时不限制",
+    )
     return parser
 
 
@@ -143,6 +148,7 @@ def main(
         harness = RuntimeHarness(
             max_model_requests=args.max_model_requests,
             max_tool_calls=args.max_tool_calls,
+            timeout_seconds=args.timeout_seconds,
         )
     except ValueError as exc:
         parser.error(str(exc))

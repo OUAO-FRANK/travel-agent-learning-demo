@@ -65,6 +65,82 @@ class FakeModelTests(unittest.TestCase):
 
 
 class TravelAgentTests(unittest.TestCase):
+    def test_harness_stops_after_a_model_call_returns_past_the_deadline(self):
+        now = [0.0]
+
+        class SlowModel:
+            def complete(self, messages, tools=()):
+                now[0] = 6.0
+                return "这份回答已经超时"
+
+        agent = TravelAgent(
+            SlowModel(),
+            harness=RuntimeHarness(
+                timeout_seconds=5,
+                clock=lambda: now[0],
+            ),
+        )
+
+        result = agent.run("规划旅行")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertIn("runtime_timeout_exceeded", result.answer)
+        self.assertEqual(
+            [event.kind for event in result.events],
+            [
+                "user_input",
+                "model_request",
+                "harness_timeout_reached",
+                "run_finished",
+            ],
+        )
+
+    def test_harness_records_a_tool_result_then_stops_if_tool_exceeded_deadline(self):
+        now = [0.0]
+
+        def slow_weather_tool(arguments):
+            now[0] = 6.0
+            return f"{arguments['city']}晴朗"
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_weather",
+                description="查询城市天气",
+                schema={"city": str},
+                handler=slow_weather_tool,
+            )
+        )
+        model = FakeModel(
+            [
+                ToolCall(name="get_weather", arguments={"city": "上海"}),
+                "不会被请求到的最终答案",
+            ]
+        )
+        agent = TravelAgent(
+            model,
+            registry=registry,
+            harness=RuntimeHarness(
+                timeout_seconds=5,
+                clock=lambda: now[0],
+            ),
+        )
+
+        result = agent.run("查上海天气")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(
+            [event.kind for event in result.events],
+            [
+                "user_input",
+                "model_request",
+                "tool_requested",
+                "tool_result",
+                "harness_timeout_reached",
+                "run_finished",
+            ],
+        )
+
     def test_harness_stops_before_a_second_model_request_when_budget_is_exhausted(self):
         model = FakeModel(
             [

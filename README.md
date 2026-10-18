@@ -21,9 +21,10 @@ FakeModel 还可以用 `--demo-tool-batch` 一次返回两个天气工具调用�
 `tool_queue_finished`。当前队列是串行、fail-fast 的；并发、依赖关系、取消和重试
 仍留到后续课程。
 
-Runtime Harness 当前先提供运行预算：`--max-model-requests` 限制一次运行的模型请求数，
-`--max-tool-calls` 限制工具调用数。预算耗尽时 Agent 返回 `status=stopped`，并记录
-`harness_limit_reached`，不会继续调用模型或工具。
+Runtime Harness 当前提供运行预算和协作式截止时间：`--max-model-requests` 限制一次
+运行的模型请求数，`--max-tool-calls` 限制工具调用数，`--timeout-seconds` 限制一次运行
+的总时间。预算耗尽时记录 `harness_limit_reached`；截止时间到达时记录
+`harness_timeout_reached`；两种情况都会返回 `status=stopped`。
 
 `ContextBuilder` 会把 system prompt、最近的完整对话轮次和工具目录组装成
 模型本轮真正收到的请求；Agent 内部的完整历史与这个请求窗口是两个不同概念。
@@ -237,6 +238,21 @@ D:\miniforge3\envs\fastapi-learn\python.exe -m app `
 
 第一次模型请求会返回工具批次并执行；工具结果回来后，第二次模型请求被 Harness
 拒绝。重点观察 `harness_limit_reached` 的 `reason` 和最后的 `status=stopped`。
+
+要观察协作式截止时间，可以给一次运行设置极短时间：
+
+```powershell
+D:\miniforge3\envs\fastapi-learn\python.exe -m app `
+  --provider fake `
+  --timeout-seconds 0 `
+  "规划上海旅行"
+```
+
+`0` 表示截止时间立即到期，程序会记录 `harness_timeout_reached` 并以 `status=stopped`
+结束。截止时间在模型、工具等同步步骤的边界检查；已经开始执行的
+同步调用不会被强行杀掉，返回后会检查是否超时并阻止后续步骤。真实 LLM 摘要器也可能
+发起模型请求，但当前 `max_model_requests` 只统计 Agent 主循环的模型请求；这一边界后续
+再通过更统一的调用适配层处理。
 
 如果你要显式使用旧名称 `deepseek-v4-flash`，只需改为：
 

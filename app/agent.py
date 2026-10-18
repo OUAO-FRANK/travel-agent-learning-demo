@@ -9,7 +9,8 @@
       -> FakeModel 返回最终文本回答
 
 这里已经加入了工具队列、SQLite 会话持久化、Memory、RAG 和最小 Runtime
-Harness，但暂时没有加入自动重试、超时或复杂 checkpoint。每项控制能力仍然
+Harness（运行预算与协作式截止时间），但暂时没有加入自动重试或复杂 checkpoint。
+每项控制能力仍然
 通过独立模块注入，方便观察它如何改变最短控制流。
 """
 
@@ -378,6 +379,16 @@ class TravelAgent:
                 tools=list(context.tools),
             )
 
+            # 同步调用正在执行时，Harness 无法安全地强行中断它；模型返回后
+            # 再检查截止时间，确保迟到的结果不会继续触发工具或成为最终答案。
+            deadline_decision = self.harness.check_deadline()
+            if not deadline_decision.allowed:
+                return self._stop_run(
+                    events,
+                    session_id,
+                    deadline_decision.reason or "runtime_timeout_exceeded",
+                )
+
             if isinstance(model_output, str):
                 # 只有文本回复可以成为最终答案。
                 assistant_message = Message(
@@ -496,6 +507,13 @@ class TravelAgent:
                     ),
                     session_id,
                 )
+                # 工具已经执行并返回，因此先记录结果，再判断它是否耗尽了
+                # 本次运行时间。即使超时，轨迹也不会丢掉已发生的事实。
+                deadline_decision = self.harness.check_deadline()
+                if not deadline_decision.allowed:
+                    raise _HarnessStop(
+                        deadline_decision.reason or "runtime_timeout_exceeded"
+                    )
                 return observation
 
             try:
@@ -538,15 +556,24 @@ class TravelAgent:
     ) -> AgentResult:
         """把 Harness 的停止决定转换成可观察的 AgentResult。"""
 
+        timeout_reached = reason == "runtime_timeout_exceeded"
+        stop_payload: dict[str, object] = {
+            "reason": reason,
+            "model_requests": self.harness.model_requests,
+            "tool_calls": self.harness.tool_calls,
+        }
+        if timeout_reached:
+            stop_payload["timeout_seconds"] = self.harness.timeout_seconds
+
         self._record_event(
             events,
             AgentEvent(
-                kind="harness_limit_reached",
-                payload={
-                    "reason": reason,
-                    "model_requests": self.harness.model_requests,
-                    "tool_calls": self.harness.tool_calls,
-                },
+                kind=(
+                    "harness_timeout_reached"
+                    if timeout_reached
+                    else "harness_limit_reached"
+                ),
+                payload=stop_payload,
             ),
             session_id,
         )

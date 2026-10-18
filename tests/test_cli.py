@@ -188,6 +188,25 @@ class CliTests(unittest.TestCase):
         self.assertIn("status=stopped", printed)
         self.assertIn("max_model_requests_exceeded", printed)
 
+    def test_main_can_stop_when_runtime_deadline_expires(self):
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--timeout-seconds",
+                    "0",
+                    "规划上海旅行",
+                ]
+            )
+
+        printed = output.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("event=harness_timeout_reached", printed)
+        self.assertIn("runtime_timeout_exceeded", printed)
+        self.assertIn("status=stopped", printed)
+
     def test_main_restores_history_when_reusing_session_id(self):
         """第二次 CLI 运行应从数据库恢复第一次运行的消息。"""
 
