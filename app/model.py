@@ -33,6 +33,10 @@ class ModelProviderError(RuntimeError):
     """模型供应商请求或响应不符合 Provider 契约时抛出的错误。"""
 
 
+class RetryableModelProviderError(ModelProviderError):
+    """可安全重试的瞬时供应商错误，例如断连、超时、429 或服务端错误。"""
+
+
 ProviderTransport = Callable[
     [str, dict[str, str], dict[str, object]],
     dict[str, object],
@@ -118,6 +122,10 @@ class OpenAICompatibleModel:
             )
         except ModelProviderError:
             raise
+        except (URLError, TimeoutError, ConnectionError) as exc:
+            # 只把明确的网络瞬态失败标记为可重试；结构错误和普通程序错误
+            # 仍然不能被 Runtime 当作瞬态故障反复请求。
+            raise RetryableModelProviderError("provider request failed") from exc
         except Exception as exc:
             raise ModelProviderError("provider request failed") from exc
 
@@ -358,9 +366,19 @@ def _urllib_transport(
         with urlopen(request, timeout=30) as response:
             decoded = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        raise ModelProviderError(f"provider returned HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise ModelProviderError("provider connection failed") from exc
+        error_type = (
+            RetryableModelProviderError
+            if exc.code == 408 or exc.code == 429 or exc.code >= 500
+            else ModelProviderError
+        )
+        try:
+            raise error_type(f"provider returned HTTP {exc.code}") from exc
+        finally:
+            # HTTPError 自己持有错误响应 body；它不是上面 with 语句中的
+            # 正常 response，因此要在异常转换前显式关闭。
+            exc.close()
+    except (URLError, TimeoutError, ConnectionError) as exc:
+        raise RetryableModelProviderError("provider connection failed") from exc
     except json.JSONDecodeError as exc:
         raise ModelProviderError("provider returned invalid JSON") from exc
 

@@ -207,6 +207,84 @@ class CliTests(unittest.TestCase):
         self.assertIn("runtime_timeout_exceeded", printed)
         self.assertIn("status=stopped", printed)
 
+    def test_main_can_stop_before_model_when_cancelled(self):
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--cancel-before-run",
+                    "规划上海旅行",
+                ]
+            )
+
+        printed = output.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("event=harness_cancelled", printed)
+        self.assertIn("reason': 'run_cancelled'", printed)
+        self.assertIn("status=stopped", printed)
+
+    def test_main_can_demonstrate_model_retry(self):
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--demo-retry",
+                    "--max-model-retries",
+                    "1",
+                    "--retry-backoff-seconds",
+                    "0",
+                    "规划上海旅行",
+                ]
+            )
+
+        printed = output.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("event=model_retry_scheduled", printed)
+        self.assertIn("answer=重试后成功生成上海旅行建议。", printed)
+        self.assertIn("status=completed", printed)
+
+    def test_main_can_stop_when_tool_round_limit_is_reached(self):
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--demo-tool-rounds",
+                    "--max-tool-rounds",
+                    "1",
+                    "查询上海天气并规划行程",
+                ]
+            )
+
+        printed = output.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("reason': 'max_tool_rounds_exceeded'", printed)
+        self.assertIn("status=stopped", printed)
+
+    def test_main_can_deny_a_tool_before_any_batch_handler_runs(self):
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(
+                [
+                    "--demo-tool-batch",
+                    "--allow-tool",
+                    "book_hotel",
+                    "同时查上海和北京天气",
+                ]
+            )
+
+        printed = output.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("event=tool_permission_denied", printed)
+        self.assertIn("status=stopped", printed)
+
     def test_main_restores_history_when_reusing_session_id(self):
         """第二次 CLI 运行应从数据库恢复第一次运行的消息。"""
 

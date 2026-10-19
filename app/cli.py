@@ -16,13 +16,37 @@ import sys
 from app.agent import TravelAgent
 from app.config import ConfigurationError, load_model_config
 from app.context import ContextBuilder
-from app.domain import ToolCall, ToolCallBatch
-from app.harness import RuntimeHarness
-from app.model import FakeModel, ModelProviderError, OpenAICompatibleModel
+from app.domain import Message, ToolCall, ToolCallBatch
+from app.harness import RetryPolicy, RuntimeHarness, ToolPolicy
+from app.model import (
+    FakeModel,
+    ModelProviderError,
+    ModelOutput,
+    OpenAICompatibleModel,
+    RetryableModelProviderError,
+)
 from app.memory import SQLiteMemoryStore
 from app.rag import KeywordRetriever
 from app.storage import SQLiteSessionStore
 from app.summarizer import ExtractiveSummarizer, LLMConversationSummarizer
+
+
+class RetryOnceDemoModel(FakeModel):
+    """FakeModel 外壳：第一次请求模拟瞬时错误，第二次返回固定回答。"""
+
+    def __init__(self) -> None:
+        super().__init__(["重试后成功生成上海旅行建议。"])
+        self._failed_once = False
+
+    def complete(
+        self,
+        messages: list[Message],
+        tools: list[dict[str, object]] | None = None,
+    ) -> ModelOutput:
+        if not self._failed_once:
+            self._failed_once = True
+            raise RetryableModelProviderError("simulated temporary network error")
+        return super().complete(messages, tools)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,6 +112,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="FakeModel 使用两个天气调用演示串行工具队列",
     )
     parser.add_argument(
+        "--demo-tool-rounds",
+        action="store_true",
+        help="FakeModel 连续请求两轮工具，用于观察工具轮数限制",
+    )
+    parser.add_argument(
+        "--demo-retry",
+        action="store_true",
+        help="FakeModel 第一次模拟网络错误、第二次成功，用于观察重试",
+    )
+    parser.add_argument(
         "--max-model-requests",
         type=int,
         default=8,
@@ -98,6 +132,39 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="本次运行最多允许的工具调用数，默认 8",
+    )
+    parser.add_argument(
+        "--max-tool-rounds",
+        type=int,
+        default=1,
+        help="模型最多可以请求工具的轮数，默认 1",
+    )
+    parser.add_argument(
+        "--max-model-retries",
+        type=int,
+        default=0,
+        help="模型请求遇到可重试网络错误时最多重试次数，默认 0",
+    )
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        default=0.5,
+        help="模型重试的初始等待秒数，后续按指数退避增加",
+    )
+    parser.add_argument(
+        "--allow-tool",
+        action="append",
+        help="加入工具白名单；可重复传入。未提供时允许所有已注册工具",
+    )
+    parser.add_argument(
+        "--approval-required-tool",
+        action="append",
+        help="标记需要人工审批的工具；本课会安全暂停，不执行该工具",
+    )
+    parser.add_argument(
+        "--cancel-before-run",
+        action="store_true",
+        help="在模型请求前发出取消信号，用于演示协作式停止",
     )
     parser.add_argument(
         "--timeout-seconds",
@@ -149,6 +216,11 @@ def main(
             max_model_requests=args.max_model_requests,
             max_tool_calls=args.max_tool_calls,
             timeout_seconds=args.timeout_seconds,
+            max_tool_rounds=args.max_tool_rounds,
+            retry_policy=RetryPolicy(
+                max_retries=args.max_model_retries,
+                backoff_seconds=args.retry_backoff_seconds,
+            ),
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -208,7 +280,17 @@ def main(
 
     if config.provider == "fake":
         # FakeModel 让 CLI 不需要 API Key 或网络，也保证演示结果可重复。
-        if args.demo_tool_batch:
+        if args.demo_tool_rounds:
+            model = FakeModel(
+                [
+                    ToolCall(name="get_weather", arguments={"city": "上海"}),
+                    ToolCall(name="get_weather", arguments={"city": "上海"}),
+                    "上海天气已查询，可以开始安排三日游。",
+                ]
+            )
+        elif args.demo_retry:
+            model = RetryOnceDemoModel()
+        elif args.demo_tool_batch:
             model = FakeModel(
                 [
                     ToolCallBatch(
@@ -254,7 +336,19 @@ def main(
         memory_store=memory_store,
         memory_user_id=args.memory_user,
         harness=harness,
+        tool_policy=ToolPolicy(
+            allowed_tools=(
+                frozenset(args.allow_tool)
+                if args.allow_tool is not None
+                else None
+            ),
+            approval_required=frozenset(args.approval_required_tool or ()),
+        ),
     )
+    if args.cancel_before_run:
+        # CLI 只负责演示如何发出取消信号；真正的服务可以把同一个
+        # CancellationToken 交给外部请求线程或 UI 按钮。
+        harness.cancel()
     try:
         result = agent.run(args.user_text, session_id=args.session_id)
     except ModelProviderError as exc:

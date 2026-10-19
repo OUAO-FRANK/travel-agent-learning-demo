@@ -8,17 +8,18 @@
       -> 如果是 ToolCall，则执行工具并把 observation 放回消息
       -> FakeModel 返回最终文本回答
 
-这里已经加入了工具队列、SQLite 会话持久化、Memory、RAG 和最小 Runtime
-Harness（运行预算与协作式截止时间），但暂时没有加入自动重试或复杂 checkpoint。
-每项控制能力仍然
-通过独立模块注入，方便观察它如何改变最短控制流。
+这里已经加入了工具队列、SQLite 会话持久化、Memory、RAG 和 Runtime Harness。
+Harness 当前负责运行预算、协作式截止时间、取消、模型有限重试、工具轮数和工具
+权限预检；SQLite checkpoint、人工审批持久化和成本预算仍在后续课程实现。
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
 from app.context import ContextBuilder
 from app.domain import AgentEvent, Message, ToolCall, ToolCallBatch
-from app.harness import RuntimeHarness
+from app.harness import HarnessStop, RuntimeHarness, ToolPolicy
 from app.model import ModelProvider
 from app.memory import (
     SQLiteMemoryStore,
@@ -30,6 +31,9 @@ from app.storage import SQLiteSessionStore
 from app.summarizer import ConversationSummarizer, ExtractiveSummarizer
 from app.tools import ToolRegistry, build_default_registry
 from app.tool_queue import ToolQueue
+
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -68,9 +72,6 @@ class TravelAgent:
     # 阶段 0 先固定它，避免 Prompt 组装本身成为额外学习负担。
     SYSTEM_PROMPT = "你是旅行规划助手。"
 
-    # 阶段 1 只允许一次工具往返，防止还没学习停止条件就引入无限循环。
-    MAX_TOOL_ROUNDS = 1
-
     def __init__(
         self,
         model: ModelProvider,
@@ -83,6 +84,7 @@ class TravelAgent:
         memory_store: SQLiteMemoryStore | None = None,
         memory_user_id: str | None = None,
         harness: RuntimeHarness | None = None,
+        tool_policy: ToolPolicy | None = None,
     ) -> None:
         # 保存模型依赖，但不复制或修改模型对象。
         # Agent 负责流程，具体的 ModelProvider 实现负责产生模型回复。
@@ -121,6 +123,7 @@ class TravelAgent:
         self.rag_top_k = rag_top_k
         self.tool_queue = ToolQueue()
         self.harness = RuntimeHarness() if harness is None else harness
+        self.tool_policy = ToolPolicy() if tool_policy is None else tool_policy
 
         # Memory 必须同时知道“存到哪里”和“属于哪个用户”。如果只传其中
         # 一个，记忆可能丢失或错误地串到别的用户，因此启动时直接拒绝。
@@ -146,9 +149,9 @@ class TravelAgent:
         6. 记录模型响应和运行完成事件；
         7. 返回不可变的 AgentResult。
 
-        当前方法最多执行一轮工具。FakeModel 如果没有可用回复，会把
-        异常传出；我们暂时不自动重试，因为重试策略要到可靠执行阶段
-        再单独设计和测试。
+        工具轮数、取消和模型重试由注入的 RuntimeHarness 控制。同步模型或工具
+        正在执行时不能被安全强杀，取消会在下一个运行边界生效。FakeModel 如果
+        没有可用回复，仍会把普通 RuntimeError 原样暴露，便于发现脚本配置错误。
         """
 
         if self.session_store is not None and session_id is None:
@@ -173,6 +176,16 @@ class TravelAgent:
             ),
             session_id,
         )
+
+        # 在写入消息、Memory 或 RAG 结果前先检查一次运行信号。预取消的
+        # 请求仍保留 user_input 轨迹，但不应产生任何业务状态副作用。
+        initial_runtime_decision = self.harness.check_runtime()
+        if not initial_runtime_decision.allowed:
+            return self._stop_run(
+                events,
+                session_id,
+                initial_runtime_decision.reason or "runtime_stopped",
+            )
 
         # history 是 Agent 内部累积的对话历史，不直接等同于模型请求。
         # system prompt 在每轮由 ContextBuilder 加入，避免混入可截断历史。
@@ -273,8 +286,6 @@ class TravelAgent:
                 session_id,
             )
 
-        tool_rounds = 0
-
         while True:
             # 每次模型请求前都重新检查预算，而不是只在 run() 开始时检查。
             # 原因是一次工具往返会追加 assistant(tool_call) 和 tool 两条消息；
@@ -316,7 +327,45 @@ class TravelAgent:
                         ),
                         session_id,
                     )
-                    summary_text = self.summarizer.summarize(older_messages)
+                    try:
+                        summary_operation = lambda: self.summarizer.summarize(
+                            older_messages
+                        )
+                        if getattr(
+                            self.summarizer,
+                            "consumes_model_budget",
+                            True,
+                        ):
+                            # 只有真的请求模型的摘要器才消耗模型请求预算，并
+                            # 进入有限重试；默认本地摘要显式声明不消耗预算。
+                            # 未声明策略的自定义摘要器按“可能访问模型”处理，
+                            # 避免漏掉它实际发出的供应商请求。
+                            summary_text = self._execute_model(
+                                events,
+                                session_id,
+                                summary_operation,
+                                {
+                                    "purpose": "context_summary",
+                                    "message_count": len(older_messages) + 1,
+                                    "compressed_messages": summarized_messages,
+                                },
+                            )
+                        else:
+                            # 本地摘要没有供应商请求，但仍遵守运行总超时和取消，
+                            # 避免一次耗时的自定义摘要后继续调用主模型。
+                            before_summary = self.harness.check_runtime()
+                            if not before_summary.allowed:
+                                raise HarnessStop(
+                                    before_summary.reason or "runtime_stopped"
+                                )
+                            summary_text = summary_operation()
+                            after_summary = self.harness.check_runtime()
+                            if not after_summary.allowed:
+                                raise HarnessStop(
+                                    after_summary.reason or "runtime_stopped"
+                                )
+                    except HarnessStop as stop:
+                        return self._stop_run(events, session_id, stop.reason)
                     self._record_event(
                         events,
                         AgentEvent(
@@ -344,22 +393,18 @@ class TravelAgent:
                 retrieval_context=retrieval_context,
             )
 
-            model_decision = self.harness.consume_model_request()
-            if not model_decision.allowed:
-                return self._stop_run(
+            # 每次真正的供应商尝试都会记录 model_request 并消耗一次预算，
+            # 包括下面可能发生的重试。
+            try:
+                model_output = self._execute_model(
                     events,
                     session_id,
-                    model_decision.reason or "runtime_budget_exceeded",
-                )
-
-            # 每次请求模型前都记录消息摘要。
-            # 第二次请求会包含 assistant 的 ToolCall 和 tool observation，
-            # 这正是 Agent Loop 与阶段 0 单轮调用的关键区别。
-            self._record_event(
-                events,
-                AgentEvent(
-                    kind="model_request",
-                    payload={
+                    lambda: self.model.complete(
+                        list(context.messages),
+                        tools=list(context.tools),
+                    ),
+                    {
+                        "purpose": "agent",
                         "message_count": len(context.messages),
                         "roles": [message.role for message in context.messages],
                         "tool_count": len(context.tools),
@@ -368,26 +413,9 @@ class TravelAgent:
                         "recalled_memory_ids": list(recalled_memory_ids),
                         "retrieved_sources": list(retrieved_sources),
                     },
-                ),
-                session_id,
-            )
-
-            # 模型可能直接回答，也可能提出工具调用。
-            # Agent 只依赖 ModelProvider 契约，不关心具体供应商实现。
-            model_output = self.model.complete(
-                list(context.messages),
-                tools=list(context.tools),
-            )
-
-            # 同步调用正在执行时，Harness 无法安全地强行中断它；模型返回后
-            # 再检查截止时间，确保迟到的结果不会继续触发工具或成为最终答案。
-            deadline_decision = self.harness.check_deadline()
-            if not deadline_decision.allowed:
-                return self._stop_run(
-                    events,
-                    session_id,
-                    deadline_decision.reason or "runtime_timeout_exceeded",
                 )
+            except HarnessStop as stop:
+                return self._stop_run(events, session_id, stop.reason)
 
             if isinstance(model_output, str):
                 # 只有文本回复可以成为最终答案。
@@ -424,16 +452,48 @@ class TravelAgent:
                 # 适配器违反了契约，不能把它当作正常答案继续传播。
                 raise TypeError("model output must be text, ToolCall, or ToolCallBatch")
 
-            if tool_rounds >= self.MAX_TOOL_ROUNDS:
-                # 工具调用次数是运行边界的一部分，防止模型无限请求工具。
-                raise RuntimeError("maximum tool rounds exceeded")
-
-            tool_rounds += 1
             calls = (
                 (model_output,)
                 if isinstance(model_output, ToolCall)
                 else model_output.calls
             )
+
+            round_decision = self.harness.consume_tool_round()
+            if not round_decision.allowed:
+                return self._stop_run(
+                    events,
+                    session_id,
+                    round_decision.reason or "max_tool_rounds_exceeded",
+                )
+
+            # 批次先整体过权限检查，再创建队列或调用任何 handler。
+            # 这样批次里即使前几个工具合法，后面一个不允许也不会留下
+            # “做了一半”的外部副作用。
+            policy_decision = self.tool_policy.check(calls)
+            if not policy_decision.allowed:
+                permission_kind = (
+                    "tool_approval_required"
+                    if policy_decision.reason
+                    and policy_decision.reason.startswith("tool_approval_required:")
+                    else "tool_permission_denied"
+                )
+                self._record_event(
+                    events,
+                    AgentEvent(
+                        kind=permission_kind,
+                        payload={
+                            "reason": policy_decision.reason,
+                            "tools": [call.name for call in calls],
+                        },
+                    ),
+                    session_id,
+                )
+                return self._stop_run(
+                    events,
+                    session_id,
+                    policy_decision.reason or "tool_permission_denied",
+                )
+
             is_batch = len(calls) > 1
 
             # 把模型的动作也放进消息历史。下一轮模型需要知道自己刚才
@@ -465,16 +525,16 @@ class TravelAgent:
                 call_counter += 1
                 tool_decision = self.harness.consume_tool_call()
                 if not tool_decision.allowed:
-                    raise _HarnessStop(
+                    raise HarnessStop(
                         tool_decision.reason or "runtime_budget_exceeded"
                     )
                 call_id = (
                     self.session_store.next_tool_call_id(session_id)
                     if self.session_store is not None and session_id is not None
                     else (
-                        f"call-{tool_rounds}-{call_counter}"
+                        f"call-{self.harness.tool_rounds}-{call_counter}"
                         if is_batch
-                        else f"call-{tool_rounds}"
+                        else f"call-{self.harness.tool_rounds}"
                     )
                 )
                 self._record_event(
@@ -489,6 +549,14 @@ class TravelAgent:
                     ),
                     session_id,
                 )
+
+                # tool_requested 事件可能被同步持久化，也可能在持久化期间收到
+                # 取消；在进入 handler 前再次检查，确保取消后不启动副作用。
+                tool_runtime_decision = self.harness.check_runtime()
+                if not tool_runtime_decision.allowed:
+                    raise HarnessStop(
+                        tool_runtime_decision.reason or "runtime_stopped"
+                    )
 
                 # Runtime 执行工具，而不是让模型直接执行 Python 函数。
                 observation = self.registry.dispatch(call)
@@ -509,16 +577,16 @@ class TravelAgent:
                 )
                 # 工具已经执行并返回，因此先记录结果，再判断它是否耗尽了
                 # 本次运行时间。即使超时，轨迹也不会丢掉已发生的事实。
-                deadline_decision = self.harness.check_deadline()
-                if not deadline_decision.allowed:
-                    raise _HarnessStop(
-                        deadline_decision.reason or "runtime_timeout_exceeded"
+                runtime_decision = self.harness.check_runtime()
+                if not runtime_decision.allowed:
+                    raise HarnessStop(
+                        runtime_decision.reason or "runtime_stopped"
                     )
                 return observation
 
             try:
                 self.tool_queue.execute(calls, execute_one)
-            except _HarnessStop as stop:
+            except HarnessStop as stop:
                 return self._stop_run(events, session_id, stop.reason)
             if is_batch:
                 self._record_event(
@@ -542,6 +610,64 @@ class TravelAgent:
         if self.session_store is not None and session_id is not None:
             self.session_store.append_event(session_id, event)
 
+    def _execute_model(
+        self,
+        events: list[AgentEvent],
+        session_id: str | None,
+        operation: Callable[[], T],
+        request_payload: dict[str, object],
+    ) -> T:
+        """通过 Harness 执行一次模型操作，并记录每次尝试与重试。
+
+        ``operation`` 可以是 Agent 主请求，也可以是 LLM 摘要请求。统一经过
+        这里，保证重试尝试会逐次消耗同一份模型预算，且不会漏掉摘要费用。
+        """
+
+        def record_attempt(attempt: int) -> None:
+            # 每次回调对应一次真实 Provider 调用，而不是逻辑上的一个请求。
+            self._record_event(
+                events,
+                AgentEvent(
+                    kind="model_request",
+                    payload={**request_payload, "attempt": attempt},
+                ),
+                session_id,
+            )
+
+        def record_retry(attempt, error, delay_seconds: float) -> None:
+            self._record_event(
+                events,
+                AgentEvent(
+                    kind="model_retry_scheduled",
+                    payload={
+                        "attempt": attempt,
+                        "error_type": type(error).__name__,
+                        "delay_seconds": delay_seconds,
+                    },
+                ),
+                session_id,
+            )
+
+        def record_exhaustion(attempt, error) -> None:
+            self._record_event(
+                events,
+                AgentEvent(
+                    kind="harness_retry_exhausted",
+                    payload={
+                        "attempt": attempt,
+                        "error_type": type(error).__name__,
+                    },
+                ),
+                session_id,
+            )
+
+        return self.harness.execute_model(
+            operation,
+            on_attempt=record_attempt,
+            on_retry=record_retry,
+            on_exhausted=record_exhaustion,
+        )
+
     def _record_message(self, message: Message, session_id: str | None) -> None:
         """在启用会话时保存一条新增消息。"""
 
@@ -561,19 +687,42 @@ class TravelAgent:
             "reason": reason,
             "model_requests": self.harness.model_requests,
             "tool_calls": self.harness.tool_calls,
+            "tool_rounds": self.harness.tool_rounds,
         }
         if timeout_reached:
             stop_payload["timeout_seconds"] = self.harness.timeout_seconds
 
+        stop_event_kind = (
+            "harness_timeout_reached"
+            if timeout_reached
+            else (
+                "harness_cancelled"
+                if reason == "run_cancelled"
+                else (
+                    "harness_limit_reached"
+                    if reason
+                    in {
+                        "max_model_requests_exceeded",
+                        "max_tool_calls_exceeded",
+                        "max_tool_rounds_exceeded",
+                    }
+                    else None
+                )
+            )
+        )
+        if stop_event_kind is not None:
+            # 只在确实命中时间、取消或计数边界时生成对应 Harness 事件。
+            # 权限拒绝和重试耗尽已有各自专属事件，不能错误地伪装成预算耗尽。
+            self._record_event(
+                events,
+                AgentEvent(kind=stop_event_kind, payload=stop_payload),
+                session_id,
+            )
         self._record_event(
             events,
             AgentEvent(
-                kind=(
-                    "harness_timeout_reached"
-                    if timeout_reached
-                    else "harness_limit_reached"
-                ),
-                payload=stop_payload,
+                kind="run_stopped",
+                payload={**stop_payload, "status": "stopped"},
             ),
             session_id,
         )
@@ -590,11 +739,3 @@ class TravelAgent:
             events=tuple(events),
             status="stopped",
         )
-
-
-class _HarnessStop(RuntimeError):
-    """内部控制流异常：停止当前工具队列，不伪装成业务工具错误。"""
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason

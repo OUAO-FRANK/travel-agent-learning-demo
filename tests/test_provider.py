@@ -1,11 +1,92 @@
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
+from io import BytesIO
 
 from app.agent import TravelAgent
 from app.domain import Message, ToolCall, ToolCallBatch
-from app.model import ModelProviderError, OpenAICompatibleModel
+from app.model import (
+    ModelProviderError,
+    OpenAICompatibleModel,
+    RetryableModelProviderError,
+    _urllib_transport,
+)
 
 
 class OpenAICompatibleModelTests(unittest.TestCase):
+    def test_http_transient_errors_are_marked_retryable(self):
+        for status in (408, 429, 500, 503):
+            error = HTTPError(
+                "https://example.test/chat/completions",
+                status,
+                "temporary",
+                {},
+                BytesIO(b"{}"),
+            )
+            with self.subTest(status=status), patch(
+                "app.model.urlopen",
+                side_effect=error,
+            ):
+                with self.assertRaises(RetryableModelProviderError):
+                    _urllib_transport("https://example.test", {}, {})
+
+    def test_http_client_errors_are_not_marked_retryable(self):
+        error = HTTPError(
+            "https://example.test/chat/completions",
+            400,
+            "bad request",
+            {},
+            BytesIO(b"{}"),
+        )
+
+        with patch("app.model.urlopen", side_effect=error):
+            with self.assertRaises(ModelProviderError) as context:
+                _urllib_transport("https://example.test", {}, {})
+
+        self.assertNotIsInstance(context.exception, RetryableModelProviderError)
+
+    def test_http_response_is_closed_when_json_parsing_fails(self):
+        class Response:
+            closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.closed = True
+
+            def read(self):
+                return b"not-json"
+
+        response = Response()
+        with patch("app.model.urlopen", return_value=response):
+            with self.assertRaises(ModelProviderError):
+                _urllib_transport("https://example.test", {}, {})
+
+        self.assertTrue(response.closed)
+
+    def test_http_error_body_is_closed_when_status_is_not_successful(self):
+        class TrackedHTTPError(HTTPError):
+            closed = False
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        error = TrackedHTTPError(
+            "https://example.test/chat/completions",
+            503,
+            "service unavailable",
+            {},
+            BytesIO(b"temporary error"),
+        )
+
+        with patch("app.model.urlopen", side_effect=error):
+            with self.assertRaises(RetryableModelProviderError):
+                _urllib_transport("https://example.test", {}, {})
+
+        self.assertTrue(error.closed)
+
     def test_complete_builds_request_and_parses_text_response(self):
         captured: dict[str, object] = {}
 

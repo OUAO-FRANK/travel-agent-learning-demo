@@ -2,12 +2,40 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.domain import AgentEvent, Message, ToolCall, ToolCallBatch
 from app.storage import SQLiteSessionStore
 
 
 class SQLiteSessionStoreTests(unittest.TestCase):
+    def test_connection_is_closed_when_initial_setup_fails(self):
+        class BrokenConnection:
+            closed = False
+            rolled_back = False
+
+            def execute(self, statement, parameters=()):
+                raise RuntimeError("sqlite setup failed")
+
+            def rollback(self):
+                self.rolled_back = True
+
+            def commit(self):
+                raise AssertionError("a failed connection must not commit")
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteSessionStore(Path(directory) / "travel-agent.db")
+            connection = BrokenConnection()
+            with patch("app.storage.sqlite3.connect", return_value=connection):
+                with self.assertRaisesRegex(RuntimeError, "sqlite setup failed"):
+                    store.ensure_session("trip-1")
+
+        self.assertTrue(connection.rolled_back)
+        self.assertTrue(connection.closed)
+
     def test_messages_round_trip_after_opening_a_new_store(self):
         """进程重启后，消息应能从 SQLite 恢复为领域对象。"""
 

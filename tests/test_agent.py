@@ -5,9 +5,9 @@ from pathlib import Path
 from app.domain import AgentEvent, Message, ToolCall, ToolCallBatch
 from app.agent import TravelAgent
 from app.context import ContextBuilder
-from app.model import FakeModel
+from app.model import FakeModel, RetryableModelProviderError
 from app.memory import SQLiteMemoryStore
-from app.harness import RuntimeHarness
+from app.harness import CancellationToken, RetryPolicy, RuntimeHarness, ToolPolicy
 from app.rag import KeywordRetriever
 from app.summarizer import LLMConversationSummarizer
 from app.tools import ToolDefinition, ToolRegistry
@@ -65,6 +65,297 @@ class FakeModelTests(unittest.TestCase):
 
 
 class TravelAgentTests(unittest.TestCase):
+    def test_cancelled_run_does_not_call_model(self):
+        token = CancellationToken()
+        token.cancel()
+        model = FakeModel(["不应被请求"])
+        agent = TravelAgent(
+            model,
+            harness=RuntimeHarness(cancellation_token=token),
+        )
+
+        result = agent.run("规划上海旅行")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(model.requests, [])
+        self.assertIn("harness_cancelled", [event.kind for event in result.events])
+        self.assertEqual(result.events[-2].kind, "run_stopped")
+        self.assertEqual(result.events[-1].kind, "run_finished")
+
+    def test_cancelled_run_does_not_write_explicit_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token = CancellationToken()
+            token.cancel()
+            memory_store = SQLiteMemoryStore(Path(directory) / "memories.db")
+            result = TravelAgent(
+                FakeModel(["不应被请求"]),
+                harness=RuntimeHarness(cancellation_token=token),
+                memory_store=memory_store,
+                memory_user_id="alice",
+            ).run("请记住我喜欢历史景点")
+
+            self.assertEqual(result.status, "stopped")
+            self.assertEqual(memory_store.list("alice"), [])
+            self.assertNotIn(
+                "memory_written",
+                [event.kind for event in result.events],
+            )
+
+    def test_cancellation_after_model_response_prevents_tool_execution(self):
+        harness = RuntimeHarness()
+        executed = []
+
+        class CancellingModel:
+            def complete(self, messages, tools=None):
+                harness.cancel()
+                return ToolCall(name="write_plan", arguments={"text": "行程"})
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="write_plan",
+                description="保存行程",
+                schema={"text": str},
+                handler=lambda arguments: executed.append(arguments["text"]) or "已保存",
+            )
+        )
+
+        result = TravelAgent(
+            CancellingModel(),
+            registry=registry,
+            harness=harness,
+        ).run("规划上海旅行")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(executed, [])
+        self.assertEqual(result.events[-3].kind, "harness_cancelled")
+        self.assertEqual(result.events[-2].kind, "run_stopped")
+
+    def test_cancellation_during_model_request_event_prevents_provider_call(self):
+        harness = RuntimeHarness()
+        model = FakeModel(["不应被请求"])
+        agent = TravelAgent(model, harness=harness)
+        record_event = agent._record_event
+
+        def cancel_after_request_is_recorded(events, event, session_id):
+            record_event(events, event, session_id)
+            if event.kind == "model_request":
+                # 模拟调用方恰好在事件持久化期间发出取消请求。
+                harness.cancel()
+
+        agent._record_event = cancel_after_request_is_recorded
+
+        result = agent.run("规划上海旅行")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(model.requests, [])
+        self.assertIn("run_cancelled", result.answer)
+
+    def test_cancellation_during_tool_request_event_prevents_handler(self):
+        harness = RuntimeHarness()
+        executed = []
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="write_plan",
+                description="保存行程",
+                schema={"text": str},
+                handler=lambda arguments: executed.append(arguments["text"])
+                or "已保存",
+            )
+        )
+        agent = TravelAgent(
+            FakeModel([ToolCall(name="write_plan", arguments={"text": "行程"})]),
+            registry=registry,
+            harness=harness,
+        )
+        record_event = agent._record_event
+
+        def cancel_after_tool_request_is_recorded(events, event, session_id):
+            record_event(events, event, session_id)
+            if event.kind == "tool_requested":
+                # 记录请求和执行 handler 之间是一个必须重新检查的安全边界。
+                harness.cancel()
+
+        agent._record_event = cancel_after_tool_request_is_recorded
+
+        result = agent.run("保存旅行计划")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(executed, [])
+        self.assertIn("run_cancelled", result.answer)
+
+    def test_cancellation_during_first_batch_tool_prevents_second_tool(self):
+        harness = RuntimeHarness()
+        executed = []
+        registry = ToolRegistry()
+
+        def first_tool(arguments):
+            executed.append("first")
+            harness.cancel()
+            return "第一个工具完成"
+
+        def second_tool(arguments):
+            executed.append("second")
+            return "第二个工具完成"
+
+        registry.register(
+            ToolDefinition(
+                name="read_weather",
+                description="读取天气",
+                schema={"city": str},
+                handler=first_tool,
+            )
+        )
+        registry.register(
+            ToolDefinition(
+                name="read_places",
+                description="读取景点",
+                schema={"city": str},
+                handler=second_tool,
+            )
+        )
+        model = FakeModel(
+            [
+                ToolCallBatch(
+                    calls=(
+                        ToolCall(name="read_weather", arguments={"city": "上海"}),
+                        ToolCall(name="read_places", arguments={"city": "上海"}),
+                    )
+                )
+            ]
+        )
+
+        result = TravelAgent(
+            model,
+            registry=registry,
+            harness=harness,
+        ).run("查询天气和景点")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(executed, ["first"])
+        self.assertEqual(
+            [event.kind for event in result.events][-4:],
+            ["tool_result", "harness_cancelled", "run_stopped", "run_finished"],
+        )
+
+    def test_max_tool_rounds_stops_without_raising(self):
+        model = FakeModel(
+            [
+                ToolCall(name="get_weather", arguments={"city": "上海"}),
+                ToolCall(name="get_weather", arguments={"city": "上海"}),
+            ]
+        )
+        result = TravelAgent(
+            model,
+            harness=RuntimeHarness(max_tool_rounds=1),
+        ).run("查上海天气")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertIn("max_tool_rounds_exceeded", result.answer)
+        self.assertEqual(len(model.requests), 2)
+        self.assertEqual(
+            [event.kind for event in result.events].count("tool_requested"),
+            1,
+        )
+
+    def test_agent_retries_only_retryable_provider_errors(self):
+        class FlakyModel:
+            def __init__(self):
+                self.attempts = 0
+
+            def complete(self, messages, tools=None):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise RetryableModelProviderError("temporary network error")
+                return "上海三日游计划"
+
+        model = FlakyModel()
+        result = TravelAgent(
+            model,
+            harness=RuntimeHarness(
+                retry_policy=RetryPolicy(
+                    max_retries=1,
+                    backoff_seconds=0,
+                    sleep=lambda _: None,
+                )
+            ),
+        ).run("规划上海旅行")
+
+        self.assertEqual(result.answer, "上海三日游计划")
+        self.assertEqual(model.attempts, 2)
+        self.assertEqual(
+            [event.kind for event in result.events].count("model_request"),
+            2,
+        )
+        self.assertIn(
+            "model_retry_scheduled",
+            [event.kind for event in result.events],
+        )
+
+    def test_retry_exhaustion_returns_a_stopped_result(self):
+        class FailingModel:
+            def complete(self, messages, tools=None):
+                raise RetryableModelProviderError("temporary network error")
+
+        result = TravelAgent(
+            FailingModel(),
+            harness=RuntimeHarness(
+                retry_policy=RetryPolicy(max_retries=1, sleep=lambda _: None)
+            ),
+        ).run("规划上海旅行")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertIn("harness_retry_exhausted", result.answer)
+        self.assertIn(
+            "harness_retry_exhausted",
+            [event.kind for event in result.events],
+        )
+        self.assertNotIn(
+            "harness_limit_reached",
+            [event.kind for event in result.events],
+        )
+
+    def test_tool_policy_checks_a_batch_before_calling_any_handler(self):
+        executed = []
+        registry = ToolRegistry()
+        for tool_name in ("get_weather", "book_hotel"):
+            registry.register(
+                ToolDefinition(
+                    name=tool_name,
+                    description="测试工具",
+                    schema={"city": str},
+                    handler=lambda arguments, name=tool_name: executed.append(name) or "完成",
+                )
+            )
+        model = FakeModel(
+            [
+                ToolCallBatch(
+                    calls=(
+                        ToolCall(name="get_weather", arguments={"city": "上海"}),
+                        ToolCall(name="book_hotel", arguments={"city": "上海"}),
+                    )
+                )
+            ]
+        )
+
+        result = TravelAgent(
+            model,
+            registry=registry,
+            tool_policy=ToolPolicy(allowed_tools=frozenset({"get_weather"})),
+        ).run("查天气并预订酒店")
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(executed, [])
+        self.assertIn(
+            "tool_permission_denied",
+            [event.kind for event in result.events],
+        )
+        self.assertNotIn(
+            "harness_limit_reached",
+            [event.kind for event in result.events],
+        )
+
     def test_harness_stops_after_a_model_call_returns_past_the_deadline(self):
         now = [0.0]
 
@@ -91,6 +382,7 @@ class TravelAgentTests(unittest.TestCase):
                 "user_input",
                 "model_request",
                 "harness_timeout_reached",
+                "run_stopped",
                 "run_finished",
             ],
         )
@@ -137,6 +429,7 @@ class TravelAgentTests(unittest.TestCase):
                 "tool_requested",
                 "tool_result",
                 "harness_timeout_reached",
+                "run_stopped",
                 "run_finished",
             ],
         )
@@ -165,6 +458,7 @@ class TravelAgentTests(unittest.TestCase):
                 "tool_requested",
                 "tool_result",
                 "harness_limit_reached",
+                "run_stopped",
                 "run_finished",
             ],
         )
@@ -199,6 +493,7 @@ class TravelAgentTests(unittest.TestCase):
                 "tool_requested",
                 "tool_result",
                 "harness_limit_reached",
+                "run_stopped",
                 "run_finished",
             ],
         )
@@ -332,6 +627,7 @@ class TravelAgentTests(unittest.TestCase):
                     "用户计划下周去上海三天，喜欢历史景点，预算 2000 元；不吃辣，偏好地铁方便的路线。",
                 ]
             )
+            harness = RuntimeHarness()
             agent = TravelAgent(
                 model,
                 context_builder=ContextBuilder(
@@ -340,6 +636,7 @@ class TravelAgentTests(unittest.TestCase):
                 ),
                 session_store=store,
                 summarizer=LLMConversationSummarizer(summary_model),
+                harness=harness,
             )
 
             result = agent.run("请把路线按天安排", session_id="trip-1")
@@ -350,6 +647,7 @@ class TravelAgentTests(unittest.TestCase):
                     "user_input",
                     "context_compression_started",
                     "context_summary_requested",
+                    "model_request",
                     "context_compressed",
                     "model_request",
                     "model_response",
@@ -358,6 +656,7 @@ class TravelAgentTests(unittest.TestCase):
             )
             self.assertEqual(len(model.requests), 1)
             self.assertEqual(len(summary_model.requests), 1)
+            self.assertEqual(harness.model_requests, 2)
             self.assertEqual(
                 [message.role for message in summary_model.requests[0]][0],
                 "system",
@@ -373,6 +672,44 @@ class TravelAgentTests(unittest.TestCase):
                 len(store.load_messages("trip-1")),
                 6,
                 "SQLite 仍保存原始对话，不保存被压缩后的替代内容",
+            )
+
+    def test_local_summary_does_not_consume_model_request_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteSessionStore(Path(directory) / "travel-agent.db")
+            store.append_message(
+                "trip-1",
+                Message(role="user", content="我喜欢上海的历史景点"),
+            )
+            store.append_message(
+                "trip-1",
+                Message(role="assistant", content="我会优先安排历史建筑。"),
+            )
+            model = FakeModel(["这是加入本地摘要后的旅行建议。"])
+            harness = RuntimeHarness(max_model_requests=1)
+            agent = TravelAgent(
+                model,
+                context_builder=ContextBuilder(
+                    max_messages=3,
+                    enable_compression=True,
+                ),
+                session_store=store,
+                harness=harness,
+            )
+
+            result = agent.run("请规划三天路线", session_id="trip-1")
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(len(model.requests), 1)
+            self.assertEqual(harness.model_requests, 1)
+            model_request_events = [
+                event
+                for event in result.events
+                if event.kind == "model_request"
+            ]
+            self.assertEqual(
+                [event.payload["purpose"] for event in model_request_events],
+                ["agent"],
             )
 
     def test_tool_round_can_trigger_compression_before_second_model_request(self):
@@ -413,6 +750,7 @@ class TravelAgentTests(unittest.TestCase):
                     "tool_result",
                     "context_compression_started",
                     "context_summary_requested",
+                    "model_request",
                     "context_compressed",
                     "model_request",
                     "model_response",

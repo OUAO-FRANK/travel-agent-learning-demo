@@ -334,11 +334,12 @@ class SQLiteSessionStore:
         # 打开一个 SQLite 连接。
         connection = sqlite3.connect(self.database_path)
 
-        # SQLite 默认不启用外键约束，必须每个连接手动开启。
-        # 否则 messages/events/tool_calls 的外键只是装饰，不会真正生效。
-        connection.execute("PRAGMA foreign_keys = ON")
-
         try:
+            # SQLite 默认不启用外键约束，必须每个连接手动开启。
+            # 这一步也放进 try 中：即使连接刚打开时执行 PRAGMA 失败，
+            # finally 仍然会回滚并关闭连接。
+            connection.execute("PRAGMA foreign_keys = ON")
+
             # 把连接交给 with 块里的代码使用。
             yield connection
         except Exception:
